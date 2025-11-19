@@ -1,0 +1,3346 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>學費與班級管理系統</title>
+    <!-- 載入 Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- 載入 Firebase 核心 SDK -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { 
+            getFirestore, 
+            collection, 
+            doc, 
+            addDoc, 
+            getDoc, 
+            getDocs, 
+            setDoc, 
+            updateDoc, 
+            deleteDoc, 
+            onSnapshot, 
+            query, 
+            where,
+            writeBatch,
+            setLogLevel
+        } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // --- 全域變數 ---
+        let db, auth, userId, appId;
+        let isAuthReady = false;
+        let localClasses = [];
+        let localStudents = [];
+        let taiwanHolidays = {}; // 台灣國定假日快取
+        let customHolidays = []; // 自訂假日
+        let attendanceCache = {}; // 出勤快取
+        let localTemplates = []; // NEW: 通知模板快取
+        let billingSettings = { defaultYear: null, defaultMonth: null }; // NEW: 儲存預設帳務月份
+        
+        let currentCalendarYear = new Date().getFullYear();
+        let currentCalendarMonth = new Date().getMonth(); // 0-11
+
+        // 頁面元素
+        let pageClasses, pageCalendar, pageBilling, loadingOverlay, authStateDiv;
+        
+        // --- Firebase 初始化 (增強版: 支援 LocalStorage 與手動設定) ---
+        async function initFirebase() {
+            // 1. 綁定 DOM 元素
+            loadingOverlay = document.getElementById('loading-overlay');
+            authStateDiv = document.getElementById('auth-state');
+            pageClasses = document.getElementById('page-classes');
+            pageCalendar = document.getElementById('page-calendar');
+            pageBilling = document.getElementById('page-billing');
+
+            try {
+                let firebaseConfig = null;
+                
+                // A. 嘗試從環境變數讀取 (優先)
+                try {
+                    if (typeof __firebase_config !== 'undefined') {
+                        if (typeof __firebase_config === 'string' && __firebase_config.trim() !== '') {
+                            firebaseConfig = JSON.parse(__firebase_config);
+                            console.log("Loaded config from environment variable.");
+                        } else if (typeof __firebase_config === 'object') {
+                            firebaseConfig = __firebase_config;
+                            console.log("Loaded config object from environment.");
+                        }
+                    }
+                } catch (e) {
+                    console.warn("Failed to parse environment config:", e);
+                }
+
+                // B. 嘗試從 LocalStorage 讀取 (如果環境變數無效)
+                if (!firebaseConfig) {
+                    const localConfigStr = localStorage.getItem('tuition_manager_firebase_config');
+                    if (localConfigStr) {
+                        try {
+                            firebaseConfig = JSON.parse(localConfigStr);
+                            console.log("Loaded config from localStorage.");
+                        } catch (e) {
+                            console.error("Invalid config in localStorage");
+                        }
+                    }
+                }
+
+                // 讀取 App ID
+                appId = (typeof window.__app_id !== 'undefined' ? window.__app_id : null) || 
+                        (typeof __app_id !== 'undefined' ? __app_id : 'default-app-id');
+
+                // C. 驗證必要欄位，如果失敗則顯示設定視窗
+                if (!firebaseConfig || !firebaseConfig.apiKey) {
+                    console.error("Firebase config is missing or invalid.");
+                    showSetupModal("找不到有效的 Firebase 設定。如果您是第一次使用或在本地執行，請手動輸入設定。");
+                    return; // 中止初始化，等待用戶輸入
+                }
+
+                // 4. 初始化 Firebase
+                const app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                
+                // 開啟除錯日誌
+                setLogLevel('Debug');
+
+                // 5. 執行登入 (支援 Custom Token)
+                try {
+                    // 讀取 Token
+                    const authToken = (typeof window.__initial_auth_token !== 'undefined' ? window.__initial_auth_token : null) ||
+                                    (typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null);
+
+                    if (authToken) {
+                        console.log("Signing in with custom token...");
+                        await signInWithCustomToken(auth, authToken);
+                    } else {
+                        console.log("Signing in anonymously...");
+                        await signInAnonymously(auth);
+                    }
+                } catch (authError) {
+                    console.error("Sign-in error:", authError);
+                    // 如果是 API Key 無效導致的錯誤，也顯示設定視窗
+                    if (authError.code === 'auth/invalid-api-key') {
+                        localStorage.removeItem('tuition_manager_firebase_config'); // 清除錯誤設定
+                        showSetupModal("API Key 無效。請檢查您的設定並重新輸入。");
+                        return;
+                    }
+                    throw new Error(`登入失敗: ${authError.message}`);
+                }
+
+                // 6. 監聽認證狀態 (這是 App 啟動的關鍵)
+                onAuthStateChanged(auth, (user) => {
+                    if (user) {
+                        userId = user.uid;
+                        console.log("Authenticated User ID:", userId);
+                        
+                        // 更新 UI 狀態
+                        if (authStateDiv) {
+                            authStateDiv.innerHTML = `
+                                <p class="text-xs text-green-600">狀態：已連線</p>
+                                <p class="text-xs text-gray-500 truncate" title="${userId}">用戶ID: ${userId.substring(0, 15)}...</p>
+                            `;
+                        }
+                        
+                        isAuthReady = true;
+                        // 認證成功，開始載入資料
+                        initializeAppLogic();
+                    } else {
+                        console.warn("User is signed out.");
+                        isAuthReady = false;
+                        if (authStateDiv) authStateDiv.innerHTML = '<p class="text-xs text-red-500">狀態：未登入</p>';
+                    }
+                });
+
+            } catch (error) {
+                console.error("Firebase Init Critical Error:", error);
+                if (loadingOverlay) {
+                    loadingOverlay.innerHTML = `
+                        <div class="text-center p-6 max-w-md">
+                            <div class="text-red-600 text-5xl mb-4">⚠️</div>
+                            <h3 class="text-xl font-bold text-gray-800 mb-2">系統初始化失敗</h3>
+                            <p class="text-red-600 font-mono text-sm bg-red-50 p-3 rounded border border-red-200 break-words">
+                                ${error.message}
+                            </p>
+                            <div class="mt-4">
+                                <button onclick="localStorage.removeItem('tuition_manager_firebase_config'); location.reload();" class="bg-gray-200 text-gray-800 px-4 py-2 rounded hover:bg-gray-300">
+                                    清除設定並重試
+                                </button>
+                            </div>
+                        </div>
+                    `;
+                }
+            }
+        }
+
+        // NEW: 顯示設定視窗
+        function showSetupModal(message) {
+            const modal = document.getElementById('modal-setup-firebase');
+            const msgEl = document.getElementById('setup-error-message');
+            if (msgEl) msgEl.textContent = message;
+            if (loadingOverlay) loadingOverlay.classList.add('hidden'); // 隱藏 Loading 以顯示 Modal
+            modal.classList.remove('hidden');
+        }
+
+        // NEW: 處理儲存設定
+        function handleSaveConfig() {
+            const input = document.getElementById('firebase-config-input').value;
+            try {
+                const config = JSON.parse(input);
+                if (!config.apiKey) {
+                    alert("設定缺少 apiKey 欄位，請確認 JSON 格式正確。");
+                    return;
+                }
+                
+                localStorage.setItem('tuition_manager_firebase_config', JSON.stringify(config));
+                alert("設定已儲存！頁面將重新整理。");
+                location.reload();
+            } catch (e) {
+                alert("JSON 格式錯誤，請檢查內容。");
+                console.error(e);
+            }
+        }
+
+        // --- Firestore 路徑 (符合安全規則) ---
+        const getCollectionPath = (collectionName) => `artifacts/${appId}/users/${userId}/${collectionName}`;
+        const getDocPath = (collectionName, docId) => `${getCollectionPath(collectionName)}/${docId}`;
+
+        // --- 主應用程式 logique ---
+        function initializeAppLogic() {
+            if (!isAuthReady) return;
+            
+            console.log("App logic initialized.");
+            
+            // 設置導覽列點擊事件
+            document.getElementById('nav-classes').addEventListener('click', () => showPage('page-classes'));
+            document.getElementById('nav-calendar').addEventListener('click', () => {
+                showPage('page-calendar');
+                renderCalendar(currentCalendarYear, currentCalendarMonth);
+            });
+            document.getElementById('nav-billing').addEventListener('click', () => {
+                showPage('page-billing');
+                initBillingPage(); // 初始化帳務頁面
+            });
+
+            // 設置 Modals (彈出視窗)
+            setupModals();
+            
+            // 載入初始資料
+            loadAllData();
+            
+            // 顯示預設頁面
+            showPage('page-classes');
+            if (loadingOverlay) loadingOverlay.classList.add('hidden');
+        }
+
+        function showPage(pageId) {
+            [pageClasses, pageCalendar, pageBilling].forEach(page => {
+                if (page) page.classList.add('hidden');
+            });
+            const activePage = document.getElementById(pageId);
+            if (activePage) activePage.classList.remove('hidden');
+            
+            // 更新導覽列狀態
+            ['nav-classes', 'nav-calendar', 'nav-billing'].forEach(navId => {
+                const navEl = document.getElementById(navId);
+                if (navEl) {
+                    if (navId.includes(pageId.split('-')[1])) {
+                        navEl.classList.add('bg-blue-600', 'text-white');
+                        navEl.classList.remove('text-gray-300', 'hover:bg-gray-700');
+                    } else {
+                        navEl.classList.remove('bg-blue-600', 'text-white');
+                        navEl.classList.add('text-gray-300', 'hover:bg-gray-700');
+                    }
+                }
+            });
+        }
+        
+        function setupModals() {
+            // 關閉 Modal
+            document.querySelectorAll('[data-modal-close]').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    const modalId = btn.dataset.modalClose;
+                    document.getElementById(modalId).classList.add('hidden');
+                });
+            });
+
+            // --- 班級 Modal ---
+            document.getElementById('btn-show-add-class').addEventListener('click', () => {
+                document.getElementById('modal-add-class').classList.remove('hidden');
+            });
+            document.getElementById('form-add-class').addEventListener('submit', handleAddClass);
+            // NEW: 編輯班級
+            document.getElementById('form-edit-class').addEventListener('submit', handleEditClass);
+
+            // --- 學生 Modal ---
+            document.getElementById('form-add-student').addEventListener('submit', handleAddStudent);
+            document.getElementById('form-edit-student').addEventListener('submit', handleEditStudent); // NEW: 綁定編輯表單
+            // NEW: 學生 Modal 側邊欄 (Req 3)
+            document.getElementById('btn-show-student-list-view').addEventListener('click', () => showStudentModalView('list'));
+            document.getElementById('btn-show-student-add-view').addEventListener('click', () => showStudentModalView('add'));
+            
+            // --- 自訂假日 Modal ---
+            document.getElementById('form-add-holiday').addEventListener('submit', handleAddCustomHoliday);
+            
+            // --- 帳務頁面 ---
+            // REQ 1: 改為年/月下拉選單
+            document.getElementById('billing-year-selector').addEventListener('change', runBillingReport);
+            document.getElementById('billing-month-selector').addEventListener('change', runBillingReport);
+            document.getElementById('billing-class-selector').addEventListener('change', runBillingReport);
+            // NEW: 兄弟姐妹合併
+            document.getElementById('billing-merge-family').addEventListener('change', runBillingReport);
+            // NEW: 儲存預設帳務月份
+            document.getElementById('btn-save-billing-default').addEventListener('click', handleSaveBillingDefault);
+            
+            // --- NEW: 學生帳務 Modal 內的儲存預設按鈕 ---
+            document.getElementById('btn-save-billing-default-student-modal').addEventListener('click', handleSaveBillingDefaultFromStudentModal);
+
+            // --- 通知模板 Modal ---
+            document.getElementById('template-select').addEventListener('change', handleTemplateSelect);
+            document.getElementById('btn-save-template').addEventListener('click', handleSaveTemplate);
+            document.getElementById('btn-delete-template').addEventListener('click', handleDeleteTemplate);
+            
+            // --- NEW: 日曆導覽 ---
+            document.getElementById('btn-prev-month').addEventListener('click', () => {
+                currentCalendarMonth--;
+                if (currentCalendarMonth < 0) {
+                    currentCalendarMonth = 11;
+                    currentCalendarYear--;
+                }
+                renderCalendar(currentCalendarYear, currentCalendarMonth);
+            });
+
+            document.getElementById('btn-next-month').addEventListener('click', () => {
+                currentCalendarMonth++;
+                if (currentCalendarMonth > 11) {
+                    currentCalendarMonth = 0;
+                    currentCalendarYear++;
+                }
+                renderCalendar(currentCalendarYear, currentCalendarMonth);
+            });
+            
+            // NEW: 通用確認視窗 (for Delete Class)
+            document.getElementById('btn-confirm-cancel').addEventListener('click', () => {
+                document.getElementById('modal-confirm').classList.add('hidden');
+            });
+            // btn-confirm-action 的事件會由開啟它的函式動態綁定
+            
+            // --- NEW: 綁定繳費詳情 Modal ---
+            document.getElementById('btn-save-payment-details').addEventListener('click', handleSavePayment);
+            document.getElementById('btn-mark-unpaid').addEventListener('click', handleMarkUnpaid);
+
+            // NEW: 綁定設定儲存
+            document.getElementById('btn-save-config').addEventListener('click', handleSaveConfig);
+        }
+
+        // --- 資料載入 (需求 1, 2) ---
+        function loadAllData() {
+            if (!isAuthReady) return;
+
+            // 監聽班級
+            const classesQuery = query(collection(db, getCollectionPath('classes')));
+            onSnapshot(classesQuery, (snapshot) => {
+                localClasses = [];
+                snapshot.forEach((doc) => {
+                    // NEW: Add default order if missing
+                    const data = doc.data();
+                    if (data.order === undefined) {
+                        // Use a large number as default if 'order' is missing
+                        // so it appears at the end of legacy data
+                        data.order = Date.now(); 
+                    }
+                    localClasses.push({ id: doc.id, ...doc.data() });
+                });
+                
+                // NEW: Sort by order
+                localClasses.sort((a, b) => a.order - b.order);
+                
+                console.log("Classes loaded (sorted):", localClasses);
+                renderClasses();
+                populateClassFilter(); // NEW: 更新篩選器
+                // 如果日曆可見，重新渲染
+                if (!pageCalendar.classList.contains('hidden')) {
+                    renderCalendar(currentCalendarYear, currentCalendarMonth);
+                }
+            }, (error) => console.error("Error loading classes: ", error));
+
+            // 監聽學生
+            const studentsQuery = query(collection(db, getCollectionPath('students')));
+            onSnapshot(studentsQuery, (snapshot) => {
+                localStudents = [];
+                snapshot.forEach((doc) => {
+                    localStudents.push({ id: doc.id, ...doc.data() });
+                });
+                console.log("Students loaded:", localStudents);
+
+                renderClasses(); 
+                updateFamilyIdDatalist(); // NEW: 更新 Family ID 下拉選單
+
+                // 如果學生管理視窗開啟，重新渲染
+                const studentModal = document.getElementById('modal-manage-students');
+                if (!studentModal.classList.contains('hidden')) {
+                    const classId = studentModal.dataset.classId;
+                    renderStudentList(classId);
+                }
+            }, (error) => console.error("Error loading students: ", error));
+
+            // 監聽自訂假日
+            const holidaysQuery = query(collection(db, getCollectionPath('customHolidays')));
+            onSnapshot(holidaysQuery, (snapshot) => {
+                customHolidays = [];
+                snapshot.forEach((doc) => {
+                    customHolidays.push({ id: doc.id, ...doc.data() });
+                });
+                console.log("Custom holidays loaded:", customHolidays);
+                if (!pageCalendar.classList.contains('hidden')) {
+                    renderCalendar(currentCalendarYear, currentCalendarMonth);
+                }
+            }, (error) => console.error("Error loading custom holidays: ", error));
+
+            // 監聽出勤紀錄 (这个Equity很大，未来可优化)
+            const attendanceQuery = query(collection(db, getCollectionPath('attendance')));
+            onSnapshot(attendanceQuery, (snapshot) => {
+                attendanceCache = {};
+                snapshot.forEach((doc) => {
+                    const data = doc.data();
+                    attendanceCache[data.date] = attendanceCache[data.date] || {};
+                    attendanceCache[data.date][data.studentId] = { id: doc.id, ...data };
+                });
+                console.log("Attendance cache updated.");
+                if (!pageCalendar.classList.contains('hidden')) {
+                    renderCalendar(currentCalendarYear, currentCalendarMonth);
+                }
+                // REQ 3: 如果學生帳務視窗開啟，重新渲染
+                if (!document.getElementById('modal-student-billing').classList.contains('hidden')) {
+                    const studentId = document.getElementById('modal-student-billing').dataset.studentId;
+                    const studentName = document.getElementById('modal-student-billing').dataset.studentName;
+                    if (studentId) {
+                        renderStudentBillingMonth(studentId, studentName);
+                    }
+                }
+            }, (error) => console.error("Error loading attendance: ", error));
+            
+            // NEW: 監聽通知模板
+            const templatesQuery = query(collection(db, getCollectionPath('notificationTemplates')));
+            onSnapshot(templatesQuery, (snapshot) => {
+                localTemplates = [];
+                snapshot.forEach((doc) => {
+                    localTemplates.push({ id: doc.id, ...doc.data() });
+                });
+                console.log("Notification templates loaded:", localTemplates);
+                checkAndCreateDefaultTemplate(); // 檢查是否有預設模板
+            }, (error) => console.error("Error loading templates: ", error));
+
+            // NEW: 監聽使用者設定 (for default billing month)
+            const settingsDocRef = doc(db, getDocPath('userSettings', 'config'));
+            onSnapshot(settingsDocRef, (docSnap) => {
+                if (docSnap.exists()) {
+                    const data = docSnap.data();
+                    billingSettings.defaultYear = data.defaultBillingYear || null;
+                    billingSettings.defaultMonth = data.defaultBillingMonth || null;
+                    console.log("User billing settings loaded:", billingSettings);
+                } else {
+                    console.log("No user settings found. Using system date as default.");
+                    // NEW: 確保如果資料庫沒設定，本地也清空
+                    billingSettings.defaultYear = null;
+                    billingSettings.defaultMonth = null;
+                }
+                // 重新初始化帳務頁面以套用預設值 (如果它剛好是開啟的)
+                if (!pageBilling.classList.contains('hidden')) {
+                    initBillingPage();
+                }
+            }, (error) => console.error("Error loading user settings: ", error));
+        }
+
+        // NEW: 儲存預設帳務月份 (from Main Page)
+        async function handleSaveBillingDefault() {
+            if (!isAuthReady) return;
+
+            const year = document.getElementById('billing-year-selector').value;
+            const month = document.getElementById('billing-month-selector').value;
+
+            if (!year || !month) {
+                alert("請先選擇年份和月份。");
+                return;
+            }
+
+            const btn = document.getElementById('btn-save-billing-default');
+            btn.disabled = true;
+            btn.textContent = "儲存中...";
+
+            try {
+                const docRef = doc(db, getDocPath('userSettings', 'config'));
+                const yearInt = parseInt(year);
+                const monthInt = parseInt(month);
+
+                await setDoc(docRef, { 
+                    defaultBillingYear: yearInt, 
+                    defaultBillingMonth: monthInt
+                }, { merge: true }); // 使用 merge 確保不會覆蓋其他可能的設定
+                
+                // *** FIX: Manually update local state to win the race condition ***
+                billingSettings.defaultYear = yearInt;
+                billingSettings.defaultMonth = monthInt;
+                
+                alert(`預設月份已儲存為：${year} 年 ${month} 月`);
+                
+                // onSnapshot 會自動抓取更新並更新 billingSettings 變數
+                
+            } catch (error) {
+                console.error("Error saving default billing month:", error);
+                alert("儲存失敗！");
+            } finally {
+                btn.disabled = false;
+                btn.textContent = "設為預設";
+            }
+        }
+
+        // NEW: 儲存預設帳務月份 (from Student Modal)
+        async function handleSaveBillingDefaultFromStudentModal(e) {
+            if (!isAuthReady) return;
+
+            const year = document.getElementById('student-billing-year-selector').value;
+            const month = document.getElementById('student-billing-month-selector').value;
+
+            if (!year || !month) {
+                alert("請先選擇年份和月份。");
+                return;
+            }
+
+            const btn = e.currentTarget; // Get the button that was clicked
+            btn.disabled = true;
+            btn.textContent = "儲存中...";
+
+            try {
+                const docRef = doc(db, getDocPath('userSettings', 'config'));
+                const yearInt = parseInt(year);
+                const monthInt = parseInt(month);
+
+                await setDoc(docRef, { 
+                    defaultBillingYear: yearInt, 
+                    defaultBillingMonth: monthInt 
+                }, { merge: true });
+                
+                // *** FIX: Manually update local state to win the race condition ***
+                billingSettings.defaultYear = yearInt;
+                billingSettings.defaultMonth = monthInt;
+
+                alert(`預設月份已儲存為：${year} 年 ${month} 月`);
+                
+                // onSnapshot listener will automatically update billingSettings 
+                // and call initBillingPage(), which updates the main billing page's selectors.
+                // This ensures the next time openStudentBillingModal is called, it reads the new default.
+                
+            } catch (error) {
+                console.error("Error saving default billing month from student modal:", error);
+                alert("儲存失敗！");
+            } finally {
+                btn.disabled = false;
+                btn.textContent = "設為預設";
+            }
+        }
+
+
+        // NEW: 檢查並建立預設模板
+        async function checkAndCreateDefaultTemplate() {
+            if (!isAuthReady || localTemplates.length > 0) {
+                return; // 如果已載入或已有模板，則不執行
+            }
+
+            console.log("No templates found. Creating default template...");
+            try {
+                // NEW: 更新預設模板以包含雜費
+                const defaultContent = `
+{家長姓名} 您好：
+
+通知您 {學生姓名} 同學 {年份} 年 {月份} 月的學費帳單。
+
+本月學費 (共 {上課堂數} 堂)：{學費金額}
+本月雜費：{雜費金額}
+(雜費明細: {雜費明細})
+
+---------------------
+應繳總金額為： {應繳金額} 元
+
+感謝您！
+                `.trim();
+                
+                await addDoc(collection(db, getCollectionPath('notificationTemplates')), {
+                    name: "預設通知模板",
+                    content: defaultContent
+                });
+                // onSnapshot 會自動抓到這個更新
+            } catch (error) {
+                console.error("Error creating default template:", error);
+            }
+        }
+
+        // --- 模組 1 & 2: 班級與學生管理 ---
+        function renderClasses() {
+            const container = document.getElementById('class-list-container');
+            container.innerHTML = '';
+            if (localClasses.length === 0) {
+                container.innerHTML = '<p class="text-gray-500">尚未新增任何班級。</p>';
+                return;
+            }
+            
+            localClasses.forEach(cls => {
+                const studentsInClass = localStudents.filter(s => s.classId === cls.id);
+                const scheduleDays = (cls.schedule || []).map(d => ["日", "一", "二", "三", "四", "五", "六"][d]).join(', ');
+                
+                const card = document.createElement('div');
+                // ADDED: relative positioning for layout
+                card.className = "bg-white p-6 rounded-lg shadow-md hover:shadow-lg transition-shadow relative";
+                
+                // MODIFIED: Added edit button next to title
+                card.innerHTML = `
+                    <div class="flex justify-between items-center mb-2">
+                        <h3 class="text-xl font-semibold text-blue-700">${cls.name}</h3>
+                        <button class="btn-edit-class text-gray-500 hover:text-blue-600 p-1 rounded-full hover:bg-gray-100 transition-colors" 
+                                data-class-id="${cls.id}" 
+                                title="編輯班級">
+                            <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                                <path stroke-linecap="round" stroke-linejoin="round" d="M16.862 4.487l1.687-1.688a1.875 1.875 0 112.652 2.652L10.582 16.07a4.5 4.5 0 01-1.897 1.13L6 18l.8-2.685a4.5 4.5 0 011.13-1.897l8.932-8.931zm0 0L19.5 7.125M18 14v4.75A2.25 2.25 0 0115.75 21H5.25A2.25 2.25 0 013 18.75V8.25A2.25 2.25 0 015.25 6H10" />
+                            </svg>
+                        </button>
+                    </div>
+                    <p class="text-gray-600">固定課表：每週 ${scheduleDays || '未設定'}</p>
+                    <p class="text-gray-600 mt-1">學生人數：${studentsInClass.length} 人</p>
+                    <div class="mt-4 space-x-2">
+                        <button data-class-id="${cls.id}" data-class-name="${cls.name}" class="btn-manage-students bg-blue-500 hover:bg-blue-600 text-white px-4 py-2 rounded-md text-sm">
+                            管理學生
+                        </button>
+                        <button data-class-id="${cls.id}" class="btn-delete-class bg-red-500 hover:bg-red-600 text-white px-4 py-2 rounded-md text-sm">
+                            刪除班級
+                        </button>
+                        <!-- NEW: Move buttons -->
+                        <button data-class-id="${cls.id}" class="btn-move-class-up bg-gray-400 hover:bg-gray-500 text-white px-3 py-1 rounded-md text-xs" title="上移">
+                            &uarr;
+                        </button>
+                        <button data-class-id="${cls.id}" class="btn-move-class-down bg-gray-400 hover:bg-gray-500 text-white px-3 py-1 rounded-md text-xs" title="下移">
+                            &darr;
+                        </button>
+                    </div>
+                `;
+                container.appendChild(card);
+            });
+
+            // 綁定事件
+            document.querySelectorAll('.btn-manage-students').forEach(btn => {
+                btn.addEventListener('click', (e) => {
+                    const classId = e.target.dataset.classId;
+                    const className = e.target.dataset.className;
+                    openStudentManager(classId, className);
+                });
+            });
+            document.querySelectorAll('.btn-delete-class').forEach(btn => {
+                btn.addEventListener('click', (e) => {
+                    handleDeleteClass(e.target.dataset.classId);
+                });
+            });
+            
+            // NEW: 綁定編輯班級按鈕
+            document.querySelectorAll('.btn-edit-class').forEach(btn => {
+                btn.addEventListener('click', (e) => {
+                    // 注意：使用 currentTarget 確保點擊 svg 也能抓到 button
+                    openEditClassModal(e.currentTarget.dataset.classId);
+                });
+            });
+
+            // NEW: 綁定排序按鈕
+            document.querySelectorAll('.btn-move-class-up').forEach(btn => {
+                btn.addEventListener('click', (e) => {
+                    handleMoveClass(e.target.dataset.classId, 'up');
+                });
+            });
+            document.querySelectorAll('.btn-move-class-down').forEach(btn => {
+                btn.addEventListener('click', (e) => {
+                    handleMoveClass(e.target.dataset.classId, 'down');
+                });
+            });
+        }
+        
+        async function handleAddClass(e) {
+            e.preventDefault();
+            if (!isAuthReady) return;
+
+            const className = document.getElementById('class-name').value;
+            const schedule = Array.from(document.querySelectorAll('#form-add-class input[name="schedule"]:checked')).map(cb => parseInt(cb.value));
+            
+            if (!className) {
+                alert("請輸入班級名稱"); // 在此專案中暫時允許 alert
+                return;
+            }
+
+            try {
+                await addDoc(collection(db, getCollectionPath('classes')), {
+                    name: className,
+                    schedule: schedule,
+                    order: Date.now() // NEW: Add order field
+                });
+                document.getElementById('form-add-class').reset();
+                document.getElementById('modal-add-class').classList.add('hidden');
+            } catch (error) {
+                console.error("Error adding class: ", error);
+            }
+        }
+        
+        // NEW: 開啟編輯班級視窗
+        function openEditClassModal(classId) {
+            const cls = localClasses.find(c => c.id === classId);
+            if (!cls) return;
+
+            document.getElementById('edit-class-id').value = cls.id;
+            document.getElementById('edit-class-name').value = cls.name;
+
+            // 設定 Checkbox 狀態
+            const checkboxes = document.querySelectorAll('#form-edit-class input[name="schedule"]');
+            checkboxes.forEach(cb => {
+                cb.checked = (cls.schedule || []).includes(parseInt(cb.value));
+            });
+
+            document.getElementById('modal-edit-class').classList.remove('hidden');
+        }
+
+        // NEW: 處理編輯班級提交
+        async function handleEditClass(e) {
+            e.preventDefault();
+            if (!isAuthReady) return;
+
+            const classId = document.getElementById('edit-class-id').value;
+            const className = document.getElementById('edit-class-name').value;
+            const schedule = Array.from(document.querySelectorAll('#form-edit-class input[name="schedule"]:checked')).map(cb => parseInt(cb.value));
+
+            if (!className) {
+                alert("請輸入班級名稱");
+                return;
+            }
+
+            const btn = e.target.querySelector('button[type="submit"]');
+            btn.disabled = true;
+            btn.textContent = "儲存中...";
+
+            try {
+                const docRef = doc(db, getDocPath('classes', classId));
+                await updateDoc(docRef, {
+                    name: className,
+                    schedule: schedule
+                });
+                document.getElementById('modal-edit-class').classList.add('hidden');
+            } catch (error) {
+                console.error("Error updating class: ", error);
+                alert("更新失敗！");
+            } finally {
+                btn.disabled = false;
+                btn.textContent = "儲存變更";
+            }
+        }
+
+        async function handleDeleteClass(classId) {
+            // OLD:
+            // if (!confirm("確定要刪除此班級嗎？此班級內的所有學生將會一併被刪除！")) {
+            //      return;
+            // }
+
+            // NEW: Open custom confirm modal
+            const modal = document.getElementById('modal-confirm');
+            document.getElementById('confirm-title').textContent = "確認刪除班級";
+            document.getElementById('confirm-message').textContent = "確定要刪除此班級嗎？此班級內的所有學生將會一併被刪除！此操作無法復原。";
+            
+            const confirmBtn = document.getElementById('btn-confirm-action');
+            
+            // --- This is key: clone and replace to remove old listeners ---
+            const newConfirmBtn = confirmBtn.cloneNode(true);
+            newConfirmBtn.className = "bg-red-600 text-white px-4 py-2 rounded-md hover:bg-red-700"; // 確保樣式
+            newConfirmBtn.textContent = "確認刪除";
+            confirmBtn.parentNode.replaceChild(newConfirmBtn, confirmBtn);
+            // --- End clone/replace ---
+
+            newConfirmBtn.addEventListener('click', async () => {
+                // Call the *actual* delete logic
+                await executeDeleteClass(classId);
+                modal.classList.add('hidden');
+            });
+
+            modal.classList.remove('hidden');
+        }
+
+        // NEW helper function to contain the original delete logic
+        async function executeDeleteClass(classId) {
+            try {
+                const batch = writeBatch(db);
+                
+                // 1. 刪除班級
+                const classDocRef = doc(db, getDocPath('classes', classId));
+                batch.delete(classDocRef);
+
+                // 2. 查詢並刪除此班級的所有學生
+                const q = query(collection(db, getCollectionPath('students')), where("classId", "==", classId));
+                const studentSnapshot = await getDocs(q);
+                studentSnapshot.forEach(studentDoc => {
+                    batch.delete(studentDoc.ref);
+                });
+                
+                // 3. (可選) 刪除相關的出勤與帳單... 這裡暫時簡化，只刪除班級與學生
+                
+                await batch.commit();
+                console.log(`Class ${classId} and its students deleted.`);
+            } catch (error) {
+                console.error("Error deleting class and students: ", error);
+            }
+        }
+        
+        // --- 學生管理 (已更新支援 Family ID) ---
+        async function handleAddStudent(e) {
+            e.preventDefault();
+            if (!isAuthReady) return;
+
+            const name = document.getElementById('student-name').value;
+            const parentContact = document.getElementById('parent-contact').value;
+            const fee = document.getElementById('student-fee').value;
+            // NEW: Family ID
+            const familyId = document.getElementById('student-family-id').value;
+            const classId = document.getElementById('modal-manage-students').dataset.classId;
+
+            if (!name || !fee || !classId) {
+                alert("請輸入學生姓名、單堂費用，並確認班級 ID。");
+                return;
+            }
+
+            try {
+                await addDoc(collection(db, getCollectionPath('students')), {
+                    name: name,
+                    parentContact: parentContact,
+                    fee: parseFloat(fee),
+                    classId: classId,
+                    familyId: familyId || "" // NEW
+                });
+                
+                // 重設表單
+                document.getElementById('form-add-student').reset();
+                showStudentModalView('list'); // NEW: 新增後切回列表 (Req 3)
+                // onSnapshot will automatically re-render the list
+            } catch (error) {
+                console.error("Error adding student: ", error);
+            }
+        }
+        
+        function openStudentManager(classId, className) {
+            const modal = document.getElementById('modal-manage-students');
+            modal.dataset.classId = classId;
+            document.getElementById('student-modal-title').textContent = `管理學生 - ${className}`;
+            
+            renderStudentList(classId); // Render list when opening
+            
+            showStudentModalView('add'); // NEW: 預設顯示 "新增" (Req 2)
+            modal.classList.remove('hidden');
+        }
+
+        function renderStudentList(classId) {
+            const listContainer = document.getElementById('student-list');
+            listContainer.innerHTML = '';
+            
+            const studentsInClass = localStudents.filter(s => s.classId === classId);
+            
+            if (studentsInClass.length === 0) {
+                listContainer.innerHTML = '<li class="text-gray-500 text-center p-4">此班級尚無學生。</li>';
+                return;
+            }
+            
+            studentsInClass.forEach(student => {
+                const li = document.createElement('li');
+                li.className = "p-3 bg-gray-50 rounded-lg border";
+                
+                // NEW: 建立 Family ID 徽章
+                const familyIdBadge = student.familyId ? 
+                    `<span class="ml-2 text-xs font-mono bg-blue-100 text-blue-800 px-2 py-0.5 rounded-full">${student.familyId}</span>` : 
+                    '';
+                
+                li.innerHTML = `
+                    <div class="flex justify-between items-center">
+                        <div>
+                            <span class="font-medium">${student.name}</span>
+                            <span class="text-sm text-gray-600 ml-2">(單堂 $${student.fee})</span>
+                            ${familyIdBadge} <!-- NEW: 顯示 Family ID -->
+                        </div>
+                        <div>
+                            <!-- NEW: 編輯按鈕 (Req 2) -->
+                            <button class="btn-edit-student text-sm text-blue-600 hover:underline mr-4" 
+                                    data-student-id="${student.id}">
+                                編輯資料
+                            </button>
+                            <button class="btn-student-billing text-sm text-blue-600 hover:underline mr-4" data-student-id="${student.id}" data-student-name="${student.name}">
+                                查看帳務
+                            </button>
+                            <button class="btn-delete-student text-sm text-red-500 hover:underline" data-student-id="${student.id}">
+                                刪除
+                            </button>
+                        </div>
+                    </div>
+                    <!-- NEW: Family ID -->
+                    <div class="mt-2 flex items-center space-x-2">
+                        <label class="text-xs font-medium text-gray-700">Family ID:</label>
+                        <input type="text" value="${student.familyId || ''}" 
+                               class="form-input w-40 px-2 py-1 border border-gray-300 rounded-md shadow-sm text-xs" 
+                               placeholder="e.g., chen-family"
+                               id="family-id-input-${student.id}">
+                        <button class="btn-save-family-id bg-gray-500 text-white px-3 py-1 rounded-md text-xs hover:bg-gray-600"
+                                data-student-id="${student.id}">
+                            儲存ID
+                        </button>
+                    </div>
+                `;
+                listContainer.appendChild(li);
+            });
+            
+            // 綁定新按鈕的事件
+            document.querySelectorAll('.btn-delete-student').forEach(btn => {
+                btn.addEventListener('click', (e) => {
+                    handleDeleteStudent(e.target.dataset.studentId);
+                });
+            });
+            
+            // NEW: 綁定編輯按鈕 (Req 2)
+            document.querySelectorAll('.btn-edit-student').forEach(btn => {
+                btn.addEventListener('click', (e) => {
+                    openEditStudentModal(e.target.dataset.studentId);
+                });
+            });
+            
+            document.querySelectorAll('.btn-student-billing').forEach(btn => {
+                btn.addEventListener('click', (e) => {
+                    openStudentBillingModal(e.target.dataset.studentId, e.target.dataset.studentName);
+                });
+            });
+            
+            // NEW: 綁定儲存 Family ID
+            document.querySelectorAll('.btn-save-family-id').forEach(btn => {
+                btn.addEventListener('click', (e) => {
+                    const studentId = e.target.dataset.studentId;
+                    const inputId = `family-id-input-${studentId}`;
+                    const familyId = document.getElementById(inputId).value;
+                    handleSaveFamilyId(studentId, familyId, e.target);
+                });
+            });
+        }
+
+        // NEW: 切換學生 Modal 視圖 (Req 3)
+        function showStudentModalView(viewName) {
+            const views = {
+                list: document.getElementById('view-student-list'),
+                add: document.getElementById('view-add-student')
+            };
+            const buttons = {
+                list: document.getElementById('btn-show-student-list-view'),
+                add: document.getElementById('btn-show-student-add-view')
+            };
+            
+            const activeClasses = 'bg-blue-600 text-white';
+            const inactiveClasses = 'text-gray-700 hover:bg-gray-200';
+
+            if (viewName === 'list') {
+                views.list.classList.remove('hidden');
+                views.add.classList.add('hidden');
+                buttons.list.classList.add(...activeClasses.split(' '));
+                buttons.list.classList.remove(...inactiveClasses.split(' '));
+                buttons.add.classList.add(...inactiveClasses.split(' '));
+                buttons.add.classList.remove(...activeClasses.split(' '));
+            } else if (viewName === 'add') {
+                views.list.classList.add('hidden');
+                views.add.classList.remove('hidden');
+                buttons.list.classList.add(...inactiveClasses.split(' '));
+                buttons.list.classList.remove(...activeClasses.split(' '));
+                buttons.add.classList.add(...activeClasses.split(' '));
+                buttons.add.classList.remove(...inactiveClasses.split(' '));
+            }
+        }
+
+        async function handleDeleteStudent(studentId) {
+            if (!confirm("確定要刪除這位學生嗎？")) {
+                return;
+            }
+            try {
+                await deleteDoc(doc(db, getDocPath('students', studentId)));
+                // onSnapshot will auto-update UI
+            } catch (error) {
+                console.error("Error deleting student: ", error);
+            }
+        }
+        
+        // --- NEW: 編輯學生 (Req 2) ---
+        function openEditStudentModal(studentId) {
+            const student = localStudents.find(s => s.id === studentId);
+            if (!student) {
+                alert("找不到學生資料。");
+                return;
+            }
+            
+            // 填入表單
+            document.getElementById('edit-student-id').value = student.id;
+            document.getElementById('edit-student-name').value = student.name;
+            document.getElementById('edit-parent-contact').value = student.parentContact || '';
+            document.getElementById('edit-student-fee').value = student.fee;
+            document.getElementById('edit-student-family-id').value = student.familyId || '';
+            
+            // 顯示 modal
+            document.getElementById('modal-edit-student').classList.remove('hidden');
+        }
+
+        async function handleEditStudent(e) {
+            e.preventDefault();
+            if (!isAuthReady) return;
+
+            const studentId = document.getElementById('edit-student-id').value;
+            const name = document.getElementById('edit-student-name').value;
+            const parentContact = document.getElementById('edit-parent-contact').value;
+            const fee = document.getElementById('edit-student-fee').value;
+            const familyId = document.getElementById('edit-student-family-id').value;
+
+            if (!studentId || !name || !fee) {
+                alert("學生ID、姓名、費用為必填。");
+                return;
+            }
+            
+            const btn = e.target.querySelector('button[type="submit"]');
+            btn.disabled = true;
+            btn.textContent = "儲存中...";
+
+            try {
+                const docRef = doc(db, getDocPath('students', studentId));
+                await updateDoc(docRef, {
+                    name: name,
+                    parentContact: parentContact,
+                    fee: parseFloat(fee),
+                    familyId: familyId || ""
+                });
+                
+                // 關閉 modal
+                document.getElementById('modal-edit-student').classList.add('hidden');
+                // onSnapshot 會自動更新學生列表
+                
+            } catch (error) {
+                console.error("Error updating student:", error);
+                alert("更新失敗！");
+            } finally {
+                btn.disabled = false;
+                btn.textContent = "儲存變更";
+            }
+        }
+        
+        // NEW: 儲存 Family ID
+        async function handleSaveFamilyId(studentId, familyId, btn) {
+            if (!isAuthReady) return;
+            
+            btn.disabled = true;
+            btn.textContent = "儲存中...";
+
+            try {
+                const docRef = doc(db, getDocPath('students', studentId));
+                await updateDoc(docRef, {
+                    familyId: familyId || "" // 儲存為空字串
+                });
+                alert("Family ID 已更新！");
+            } catch (error) {
+                console.error("Error saving Family ID:", error);
+                alert("儲存失敗！");
+            } finally {
+                btn.disabled = false;
+                btn.textContent = "儲存ID";
+            }
+        }
+        
+        // NEW: 處理班級排序
+        async function handleMoveClass(classId, direction) {
+            if (!isAuthReady) return;
+
+            // localClasses is already sorted by `order`
+            const currentIndex = localClasses.findIndex(cls => cls.id === classId);
+
+            if (currentIndex === -1) return; // Not found
+
+            let targetIndex = -1;
+            if (direction === 'up' && currentIndex > 0) {
+                targetIndex = currentIndex - 1;
+            } else if (direction === 'down' && currentIndex < localClasses.length - 1) {
+                targetIndex = currentIndex + 1;
+            }
+
+            if (targetIndex === -1) {
+                console.log("Already at edge, cannot move.");
+                return; // Already at the top or bottom
+            }
+
+            const currentClass = localClasses[currentIndex];
+            const targetClass = localClasses[targetIndex];
+
+            // Swap their 'order' values
+            const currentOrder = currentClass.order;
+            const targetOrder = targetClass.order;
+
+            try {
+                const batch = writeBatch(db);
+                
+                const docRefCurrent = doc(db, getDocPath('classes', currentClass.id));
+                batch.update(docRefCurrent, { order: targetOrder });
+                
+                const docRefTarget = doc(db, getDocPath('classes', targetClass.id));
+                batch.update(docRefTarget, { order: currentOrder });
+
+                await batch.commit();
+                // onSnapshot will handle the re-render automatically
+            } catch (error) {
+                console.error("Error moving class:", error);
+                // 暫不使用 alert
+            }
+        }
+        
+        // NEW: 更新 Family ID 的 datalist
+        function updateFamilyIdDatalist() {
+            if (!localStudents || localStudents.length === 0) return;
+
+            // 1. 取得所有不重複、非空值的 family IDs
+            const uniqueIds = new Set();
+            localStudents.forEach(student => {
+                if (student.familyId && student.familyId.trim() !== "") {
+                    uniqueIds.add(student.familyId.trim());
+                }
+            });
+
+            // 2. 找到 datalist 元素
+            const datalist = document.getElementById('family-id-list');
+            if (!datalist) return; // 元素可能尚未載入
+
+            // 3. 填入選項
+            datalist.innerHTML = ''; // 清除舊選項
+            uniqueIds.forEach(id => {
+                const option = document.createElement('option');
+                option.value = id;
+                datalist.appendChild(option);
+            });
+        }
+        
+        // --- 學生帳務 Modal (雜費功能) ---
+        async function openStudentBillingModal(studentId, studentName) {
+            const modal = document.getElementById('modal-student-billing');
+            // REQ 1 & 3: 儲存 studentId/Name 供 re-render 使用
+            modal.dataset.studentId = studentId;
+            modal.dataset.studentName = studentName;
+            
+            document.getElementById('student-billing-title').textContent = `帳務紀錄 - ${studentName}`;
+            const contentDiv = document.getElementById('student-billing-content');
+            contentDiv.innerHTML = '<p>載入中...</p>';
+            
+            // REQ 1: 填入年/月下拉選單
+            const yearSelector = document.getElementById('student-billing-year-selector');
+            const monthSelector = document.getElementById('student-billing-month-selector');
+            
+            // REQ 5 FIX: Default to the main billing page's selected date
+            // const mainBillingYear = document.getElementById('billing-year-selector').value; // OLD
+            // const mainBillingMonth = document.getElementById('billing-month-selector').value; // OLD
+            
+            // --- MODIFICATION START: Use saved billingSettings ---
+            // 再次確認此邏輯：
+            // 1. 優先使用全域變數 billingSettings 中儲存的預設值
+            // 2. 如果沒有儲存的預設值，才使用(使用者指定的) 2025/11
+            // const now = new Date(); // e.g., 2025-11-15 // <-- REMOVED
+            const defaultYear = billingSettings.defaultYear ? parseInt(billingSettings.defaultYear) : 2025; // <-- CHANGED
+            const defaultMonth = billingSettings.defaultMonth ? parseInt(billingSettings.defaultMonth) : 11; // 1-12 // <-- CHANGED
+            // --- MODIFICATION END ---
+            
+            yearSelector.innerHTML = '';
+            // NEW: Generate year range dynamically based on user request (2025-2030)
+            const startYear = 2025; // <-- CHANGED
+            const endYear = 2030;   // <-- CHANGED
+            let yearRange = new Set();
+            for (let y = endYear; y >= startYear; y--) {
+                yearRange.add(y);
+            }
+            yearRange.add(defaultYear); // 確保預設年份存在
+            
+            const sortedYears = Array.from(yearRange).sort((a, b) => a - b); // 升序排列 (FIX: a - b)
+
+            sortedYears.forEach(y => {
+                const option = document.createElement('option');
+                option.value = y;
+                option.textContent = `${y} 年`;
+                option.selected = (y === defaultYear); // 確保使用 defaultYear
+                yearSelector.appendChild(option);
+            });
+            
+            monthSelector.innerHTML = '';
+            for (let m = 1; m <= 12; m++) {
+                const option = document.createElement('option');
+                option.value = m;
+                option.textContent = `${m} 月`;
+                option.selected = (m === defaultMonth); // 確保使用 defaultMonth
+                monthSelector.appendChild(option);
+            }
+            
+            // 移除舊的監聽器 (如果有的話)
+            const newYearSelector = yearSelector.cloneNode(true);
+            yearSelector.parentNode.replaceChild(newYearSelector, yearSelector);
+            const newMonthSelector = monthSelector.cloneNode(true);
+            monthSelector.parentNode.replaceChild(newMonthSelector, monthSelector);
+
+            // *** THE FIX: Set the value AFTER cloning and replacing ***
+            // *** 這是修正：在複製並取代 *之後*，強制設定 .value ***
+            newYearSelector.value = defaultYear;
+            newMonthSelector.value = defaultMonth;
+            // *** END FIX ***
+
+            // 綁定新監聽器
+            newYearSelector.addEventListener('change', () => renderStudentBillingMonth(studentId, studentName));
+            newMonthSelector.addEventListener('change', () => renderStudentBillingMonth(studentId, studentName));
+            
+            // 顯示 Modal
+            modal.classList.remove('hidden');
+            
+            // 載入當前選定月份的資料
+            await renderStudentBillingMonth(studentId, studentName);
+        }
+        
+        // REQ 1 & 3: 新函數，用於渲染選定的單一月份帳務
+        async function renderStudentBillingMonth(studentId, studentName) {
+            const contentDiv = document.getElementById('student-billing-content');
+            contentDiv.innerHTML = '<p>載入中...</p>';
+
+            const student = localStudents.find(s => s.id === studentId);
+            if (!student) {
+                contentDiv.innerHTML = '<p class="text-red-500">找不到學生資料。</p>';
+                return;
+            }
+
+            // 1. 取得選定的年/月
+            const year = document.getElementById('student-billing-year-selector').value;
+            const month = document.getElementById('student-billing-month-selector').value;
+            const monthStr = `${year}-${String(month).padStart(2, '0')}`;
+            
+            // 2. 取得此學生的該月帳單
+            let invoice = {};
+            try {
+                const qInvoices = query(
+                    collection(db, getCollectionPath('invoices')),
+                    where("studentId", "==", studentId),
+                    where("month", "==", monthStr)
+                );
+                const invoiceSnapshot = await getDocs(qInvoices);
+                if (!invoiceSnapshot.empty) {
+                    const doc = invoiceSnapshot.docs[0];
+                    invoice = { id: doc.id, ...doc.data() };
+                }
+            } catch (error) {
+                console.error("Error fetching single student invoice:", error);
+                contentDiv.innerHTML = '<p class="text-red-500">讀取帳單失敗。</p>';
+                return;
+            }
+            
+            // 3. REQ 3: 取得該月點名 '出席' 堂數
+            const attendanceCounts = getAttendanceCount(studentId, monthStr); // MODIFIED: Removed await
+            const presentCount = attendanceCounts.present || 0;
+            
+            // 4. 決定要顯示的資料
+            const classCount = invoice.classCount || 0; // 已儲存的堂數
+            // REQ 3: 如果帳單已存在，顯示儲存的堂數；如果不存在，預設為點名堂數
+            const displayClassCount = invoice.id ? classCount : presentCount;
+            
+            // REQ 3 - 決定當月費用 (優先使用帳單中的, 否則用學生預設的)
+            const feeForThisMonth = invoice.fee !== undefined ? invoice.fee : student.fee;
+            
+            // NEW: 計算學費、雜費、總額
+            // REQ 3: 計算學費時，使用 displayClassCount
+            const tuitionAmount = invoice.tuitionAmount !== undefined ? invoice.tuitionAmount : (displayClassCount * feeForThisMonth);
+            const extraFees = invoice.extraFees || [];
+            const extraFeesTotal = extraFees.reduce((sum, fee) => sum + fee.amount, 0);
+            // REQ 3: 總額也重新計算
+            const totalAmount = invoice.amount !== undefined ? invoice.amount : (tuitionAmount + extraFeesTotal);
+            
+            // 5. 渲染 HTML
+            const monthDiv = document.createElement('div');
+            monthDiv.className = "p-4"; // 移除外框，因為現在是單一視圖
+            
+            // REQ 3: 加入點名提示
+            const attendanceText = `(點名出席: ${presentCount} 堂)`;
+
+            monthDiv.innerHTML = `
+                <h4 class="font-semibold text-gray-800">${year} 年 ${month} 月</h4>
+                
+                <!-- MODIFIED: Req 3 - 新增 "單堂費用" input -->
+                <div class="mt-2 grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div class="flex items-center space-x-2">
+                        <label class="text-sm">上課堂數：</label>
+                        <input type="number" min="0" value="${displayClassCount}" 
+                               class="form-input w-20 rounded-md shadow-sm text-sm input-class-count" 
+                               data-month="${monthStr}">
+                        <span class="text-sm text-gray-600">${attendanceText}</span>
+                    </div>
+                    <div class="flex items-center space-x-2">
+                        <label class="text-sm">單堂費用：</label>
+                        <input type="number" min="0" value="${feeForThisMonth}" 
+                               class="form-input w-24 rounded-md shadow-sm text-sm input-monthly-fee" 
+                               data-month="${monthStr}">
+                    </div>
+                </div>
+                <div class="mt-3 text-sm text-gray-700">
+                    <span>學費小計： $${tuitionAmount}</span>
+                </div>
+                
+                <div class="mt-3">
+                    <button class="btn-save-student-month bg-blue-500 text-white px-3 py-1 rounded-md text-sm hover:bg-blue-600"
+                            data-month="${monthStr}"
+                            data-student-id="${studentId}"
+                            data-invoice-id="${invoice.id || ''}">
+                        儲存本月
+                    </button>
+                </div>
+                
+                <div class="mt-3 pt-3 border-t">
+                    <h5 class="text-sm font-semibold text-gray-700 mb-2">本月雜費</h5>
+                    <div id="extra-fees-list-${monthStr}" class="space-y-1 text-sm mb-2">
+                        <!-- HTML 註解已從此處的 JS 模板字串中移除 -->
+                    </div>
+                    <form class="flex space-x-2 form-add-extra-fee" 
+                          data-month="${monthStr}" 
+                          data-student-id="${studentId}" 
+                          data-student-fee="${student.fee}" 
+                          data-invoice-id="${invoice.id || ''}">
+                        <input type="text" placeholder="項目名稱" class="form-input w-1/2 rounded-md shadow-sm text-sm fee-name" required>
+                        <input type="number" min="0" placeholder="金額" class="form-input w-1/3 rounded-md shadow-sm text-sm fee-amount" required>
+                        <button type="submit" class="bg-green-500 text-white px-3 py-1 rounded-md text-sm hover:bg-green-600 w-1/6">
+                            新增
+                        </button>
+                    </form>
+                </div>
+                <div class="mt-3 pt-3 border-t text-right">
+                    <strong class="text-lg text-blue-700">總金額： $${totalAmount}</strong>
+                </div>
+            `;
+            contentDiv.innerHTML = ''; // 清空
+            contentDiv.appendChild(monthDiv);
+            
+            // 6. 渲染雜費列表
+            renderExtraFees(monthStr, extraFees, studentId, invoice.id || '');
+
+            // 7. 綁定事件
+            contentDiv.querySelector('.btn-save-student-month').addEventListener('click', handleSaveStudentMonth);
+            contentDiv.querySelector('.form-add-extra-fee').addEventListener('submit', handleAddExtraFee);
+        }
+        
+        // REQ 3: 新增 helper 函數，用於查詢指定學生的月點名統計 (MODIFIED: Read from cache to avoid index error)
+        function getAttendanceCount(studentId, month_YYYY_MM) {
+            const [year, month] = month_YYYY_MM.split('-').map(Number);
+            const daysInMonth = new Date(year, month, 0).getDate(); // 取得該月最後一天
+            
+            const counts = {
+                present: 0,
+                sick: 0,
+                personal: 0,
+                bereavement: 0,
+                other: 0
+            };
+
+            if (!isAuthReady || !studentId) return counts;
+            
+            // Iterate through each day of the month
+            for (let day = 1; day <= daysInMonth; day++) {
+                const dateStr = `${month_YYYY_MM}-${String(day).padStart(2, '0')}`;
+                
+                // Check the cache
+                if (attendanceCache[dateStr] && attendanceCache[dateStr][studentId]) {
+                    const record = attendanceCache[dateStr][studentId];
+                    const status = record.status;
+                    if (counts.hasOwnProperty(status)) {
+                        counts[status]++;
+                    }
+                }
+            }
+            
+            // console.log(`Cache-based getAttendanceCount for ${studentId} ${month_YYYY_MM}:`, counts);
+            return counts;
+        }
+        
+        // --- FIX: 補上遺失的 renderExtraFees 函數 ---
+        // NEW: 渲染雜費列表 (從 openStudentBillingModal 中抽出)
+        function renderExtraFees(monthStr, extraFees, studentId, invoiceId) {
+            const listDiv = document.getElementById(`extra-fees-list-${monthStr}`);
+            if (!listDiv) return;
+            listDiv.innerHTML = '';
+            
+            if (!extraFees || extraFees.length === 0) {
+                listDiv.innerHTML = '<p class="text-gray-500 text-xs">無雜費項目。</p>';
+                return;
+            }
+
+            extraFees.forEach((fee, index) => {
+                const feeEl = document.createElement('div');
+                feeEl.className = "flex justify-between items-center py-0.5"; // 調整間距
+                feeEl.innerHTML = `
+                    <span class="text-gray-800">${fee.name}: $${fee.amount}</span>
+                    <button class="btn-delete-extra-fee text-red-500 hover:text-red-700" 
+                            data-index="${index}" 
+                            data-student-id="${studentId}" 
+                            data-invoice-id="${invoiceId}"
+                            title="刪除此項目">
+                        <svg class="h-4 w-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M19.5 12h-15" /></svg>
+                    </button>
+                `;
+                listDiv.appendChild(feeEl);
+            });
+            
+            // 綁定新建立的刪除按鈕
+            listDiv.querySelectorAll('.btn-delete-extra-fee').forEach(btn => {
+                btn.addEventListener('click', handleDeleteExtraFee);
+            });
+        }
+        
+        // NEW: 處理儲存學生帳務 (堂數) (MODIFIED: Req 3 - 讀取當月費用)
+        async function handleSaveStudentMonth(e) {
+            const btn = e.target;
+            const studentId = btn.dataset.studentId;
+            // const fee = parseFloat(btn.dataset.studentFee); // OLD
+            const month = btn.dataset.month;
+            let invoiceId = btn.dataset.invoiceId;
+            
+            const parentDiv = btn.closest('.p-4'); // 找到月份的區塊
+            
+            // NEW: Req 3 - 讀取當月費用 input
+            const feeInput = parentDiv.querySelector('.input-monthly-fee');
+            const fee = parseFloat(feeInput.value);
+
+            const input = parentDiv.querySelector('input.input-class-count');
+            const classCount = parseInt(input.value);
+            
+            if (isNaN(fee) || fee < 0) {
+                alert("請輸入有效的單堂費用。");
+                return;
+            }
+            if (isNaN(classCount) || classCount < 0) {
+                alert("請輸入有效的堂數。");
+                return;
+            }
+
+            const tuitionAmount = classCount * fee; // NEW: 使用當月費用計算
+
+            btn.disabled = true;
+            btn.textContent = "儲存中...";
+
+            let currentExtraFees = [];
+            let totalAmount = tuitionAmount;
+            let isPaid = false; // 預設為新
+            let paymentDate = null; // NEW
+            let paymentNotes = ""; // NEW
+
+            try {
+                if (invoiceId) {
+                    // 取得現有文件以保留雜費和付款狀態
+                    const docRef = doc(db, getDocPath('invoices', invoiceId));
+                    const existingDoc = await getDoc(docRef);
+                    if (existingDoc.exists()) {
+                        const data = existingDoc.data();
+                        currentExtraFees = data.extraFees || [];
+                        isPaid = data.isPaid || false;
+                        paymentDate = data.paymentDate || null; // NEW
+                        paymentNotes = data.paymentNotes || ""; // NEW
+                    }
+                }
+                
+                // 重新計算總額
+                totalAmount = tuitionAmount + currentExtraFees.reduce((sum, f) => sum + f.amount, 0);
+
+                const invoiceData = {
+                    studentId: studentId,
+                    month: month,
+                    classCount: classCount,
+                    fee: fee,
+                    tuitionAmount: tuitionAmount, // NEW: 儲存學費
+                    extraFees: currentExtraFees, // NEW: 儲存雜費
+                    amount: totalAmount, // NEW: 儲存總額
+                    isPaid: isPaid,
+                    paymentDate: paymentDate, // NEW
+                    paymentNotes: paymentNotes // NEW
+                };
+                
+                let docRef;
+                if (!invoiceId) {
+                    // 新增
+                    docRef = await addDoc(collection(db, getCollectionPath('invoices')), invoiceData);
+                    invoiceId = docRef.id;
+                } else {
+                    // 更新
+                    docRef = doc(db, getDocPath('invoices', invoiceId));
+                    await setDoc(docRef, invoiceData, { merge: true }); // *** FIX: Use merge: true ***
+                }
+
+                // 重新載入該月以更新所有按鈕的 data-invoice-id 和 UI
+                const student = localStudents.find(s => s.id === studentId);
+                await renderStudentBillingMonth(studentId, student.name); // REQ 1: 改為 Rerender
+                alert("堂數已儲存！");
+                
+            } catch (error) {
+                console.error("Error saving student month data:", error);
+            } finally {
+                // 重新渲染會自動解鎖按鈕
+            }
+        }
+        
+        // NEW: 處理新增雜費
+        async function handleAddExtraFee(e) {
+            e.preventDefault();
+            const form = e.target;
+            const month = form.dataset.month;
+            const studentId = form.dataset.studentId;
+            let invoiceId = form.dataset.invoiceId;
+
+            const nameInput = form.querySelector('.fee-name');
+            const amountInput = form.querySelector('.fee-amount');
+            
+            const feeName = nameInput.value;
+            const feeAmount = parseFloat(amountInput.value);
+
+            if (!feeName || isNaN(feeAmount) || feeAmount <= 0) {
+                alert("請輸入有效的項目名稱和金額。");
+                return;
+            }
+
+            if (!invoiceId) {
+                alert("請先「儲存堂數」以建立本月帳單，然後才能新增雜費。");
+                return;
+            }
+
+            const newFee = { name: feeName, amount: feeAmount };
+            form.querySelector('button').disabled = true;
+
+            try {
+                const docRef = doc(db, getDocPath('invoices', invoiceId));
+                const invoiceDoc = await getDoc(docRef);
+
+                if (!invoiceDoc.exists()) {
+                    alert("找不到帳單。請先儲存堂數。");
+                    return;
+                }
+
+                const invoiceData = invoiceDoc.data();
+                const extraFees = invoiceData.extraFees || [];
+                extraFees.push(newFee);
+                
+                const newTotalAmount = (invoiceData.tuitionAmount || 0) + extraFees.reduce((sum, f) => sum + f.amount, 0);
+
+                await updateDoc(docRef, {
+                    extraFees: extraFees,
+                    amount: newTotalAmount // 更新總額
+                });
+
+                // 重新載入 modal
+                const student = localStudents.find(s => s.id === studentId);
+                // openStudentBillingModal(studentId, student.name); // OLD
+                await renderStudentBillingMonth(studentId, student.name); // REQ 1: 改為 Rerender
+
+            } catch (error) {
+                console.error("Error adding extra fee:", error);
+                form.querySelector('button').disabled = false;
+            }
+        }
+        
+        // NEW: 處理刪除雜費
+        async function handleDeleteExtraFee(e) {
+            const btn = e.currentTarget; // 使用 currentTarget
+            const index = parseInt(btn.dataset.index);
+            const studentId = btn.dataset.studentId;
+            let invoiceId = btn.dataset.invoiceId;
+
+            if (isNaN(index) || !invoiceId) {
+                console.error("Delete failed", index, invoiceId);
+                return;
+            }
+            
+            btn.disabled = true;
+
+            try {
+                const docRef = doc(db, getDocPath('invoices', invoiceId));
+                const invoiceDoc = await getDoc(docRef);
+
+                if (!invoiceDoc.exists()) return;
+
+                const invoiceData = invoiceDoc.data();
+                let extraFees = invoiceData.extraFees || [];
+                extraFees.splice(index, 1); // 移除
+                
+                const newTotalAmount = (invoiceData.tuitionAmount || 0) + extraFees.reduce((sum, f) => sum + f.amount, 0);
+
+                await updateDoc(docRef, {
+                    extraFees: extraFees,
+                    amount: newTotalAmount // 更新總額
+                });
+
+                // 重新載入
+                const student = localStudents.find(s => s.id === studentId);
+                // openStudentBillingModal(studentId, student.name); // OLD
+                await renderStudentBillingMonth(studentId, student.name); // REQ 1: 改為 Rerender
+
+            } catch (error) {
+                console.error("Error deleting extra fee:", error);
+                btn.disabled = false;
+            }
+        }
+
+        // --- NEW: 補上遺失的日曆功能 ---
+        // (Helper) 取得台灣國定假日
+        async function fetchTaiwanHolidays(year) {
+            if (taiwanHolidays[year]) {
+                return taiwanHolidays[year]; // 從快取
+            }
+            try {
+                // 使用 Nager.Date API
+                const response = await fetch(`https://date.nager.at/api/v3/PublicHolidays/${year}/TW`);
+                if (!response.ok) {
+                    throw new Error(`Holiday API error: ${response.statusText}`);
+                }
+                const text = await response.text(); // 讀取原始文字
+                
+                // *** FIX: 處理 API 回傳空字串 (但狀態為 200) 的情況 ***
+                if (!text) {
+                    console.warn(`Empty response from holiday API for year ${year}.`);
+                    taiwanHolidays[year] = []; // 存入空陣列
+                    return [];
+                }
+                
+                const holidays = JSON.parse(text); // 嘗試解析
+                
+                // *** FIX: 檢查回傳的是否為陣列 ***
+                if (!Array.isArray(holidays)) {
+                    console.warn(`Non-array response from holiday API:`, holidays);
+                    taiwanHolidays[year] = [];
+                    return [];
+                }
+
+                taiwanHolidays[year] = holidays;
+                return holidays;
+            } catch (error) {
+                console.error(`Error fetching Taiwan holidays:`, error);
+                return []; // 發生錯誤時回傳空陣列
+            }
+        }
+        
+        async function renderCalendar(year, month) {
+            const calendarGrid = document.getElementById('calendar-grid');
+            const calendarTitle = document.getElementById('calendar-month-title');
+            calendarGrid.innerHTML = '<div class="col-span-7 h-32 text-center p-4">載入中...</div>';
+            
+            // 1. 更新標題
+            calendarTitle.textContent = `${year} 年 ${month + 1} 月`;
+            
+            // 2. 設置控制項的 data- 屬性
+            const controls = document.getElementById('calendar-controls');
+            controls.dataset.year = year;
+            controls.dataset.month = month;
+            
+            // 3. 取得假日 (國定假日 + 自訂)
+            const holidays_tw = await fetchTaiwanHolidays(year);
+            const holidaySet = new Set(holidays_tw.map(h => h.date));
+            const customHolidayMap = new Map();
+            customHolidays.forEach(h => {
+                customHolidayMap.set(h.date, h.description);
+            });
+
+            // 4. 計算日期
+            const firstDay = new Date(year, month, 1);
+            const lastDay = new Date(year, month + 1, 0);
+            const daysInMonth = lastDay.getDate();
+            const startDayOfWeek = firstDay.getDay(); // 0=Sun, 1=Mon, ...
+            
+            calendarGrid.innerHTML = '';
+            
+            // 5. 填入上個月的空格
+            for (let i = 0; i < startDayOfWeek; i++) {
+                calendarGrid.innerHTML += '<div class="bg-gray-100 border border-gray-200"></div>';
+            }
+
+            // 6. 填入本月日期
+            for (let day = 1; day <= daysInMonth; day++) {
+                const date = new Date(year, month, day);
+                const date_YYYY_MM_DD = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+                const dayOfWeek = date.getDay(); // 0-6
+                
+                let bgColor = 'bg-white';
+                let textColor = 'text-gray-900';
+                let holidayText = '';
+                
+                // 檢查是否為國定假日
+                if (holidaySet.has(date_YYYY_MM_DD)) {
+                    textColor = 'text-red-600';
+                    const holiday = holidays_tw.find(h => h.date === date_YYYY_MM_DD);
+                    holidayText = `<span class="text-xs text-red-600 truncate">${holiday.localName}</span>`;
+                }
+                
+                // 檢查是否為自訂假日
+                if (customHolidayMap.has(date_YYYY_MM_DD)) {
+                    bgColor = 'bg-yellow-100';
+                    textColor = 'text-yellow-800';
+                    holidayText = `<span class="text-xs text-yellow-800 truncate" title="點擊刪除">${customHolidayMap.get(date_YYYY_MM_DD)}</span>`;
+                }
+                
+                // 找出今天有哪些班級 (根據班級課表)
+                const classesToday = localClasses.filter(cls => (cls.schedule || []).includes(dayOfWeek));
+                
+                // 找出這些班級的所有學生
+                const studentsToday = localStudents.filter(s => classesToday.some(cls => cls.id === s.classId));
+                
+                // 取得今日出勤紀錄
+                const attendanceToday = attendanceCache[date_YYYY_MM_DD] || {};
+                const attendedCount = Object.values(attendanceToday).filter(a => a.status === 'present').length; // REQ 3: 只計算 'present'
+                const absenceCount = Object.keys(attendanceToday).length - attendedCount; // REQ 3: 計算缺席
+                
+                // 組合 HTML
+                const cell = document.createElement('div');
+                cell.className = `${bgColor} border border-gray-200 p-2 min-h-[120px] flex flex-col hover:bg-gray-50`;
+                
+                cell.innerHTML = `
+                    <div class="flex justify-between items-center">
+                        <span class="font-semibold ${textColor}">${day}</span>
+                        <button class="btn-add-holiday text-gray-400 hover:text-blue-500" data-date="${date_YYYY_MM_DD}" title="新增停課日">
+                            <svg class="h-4 w-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M6.75 3.099V1.5a1.5 1.5 0 013 0v1.599a6.75 6.75 0 1011.137 3.515M12 21a6.75 6.75 0 00-6.863-6.485M12 3.099A6.75 6.75 0 0118.863 9.584M15 3.099A6.75 6.75 0 008.137 9.584m10.726 0A6.75 6.75 0 0112 16.5m6.863-6.916A6.75 6.75 0 0012 9.584" /></svg>
+                        </button>
+                    </div>
+                    ${holidayText ? `
+                        <div class="text-xs ${textColor} p-1 rounded mt-1 ${bgColor === 'bg-yellow-100' ? 'hover:bg-yellow-200 cursor-pointer' : ''}" 
+                             ${bgColor === 'bg-yellow-100' ? `data-date="${date_YYYY_MM_DD}"` : ''} 
+                             title="${customHolidayMap.get(date_YYYY_MM_DD) || ''}">${holidayText}</div>` 
+                        : ''
+                    }
+                    
+                    ${classesToday.length > 0 ? `
+                        <div class="mt-2 text-xs text-gray-700">
+                            <strong>本日課程 (${classesToday.length}):</strong>
+                            <!-- NEW: Req 5 - Clickable class list -->
+                            <ul class="list-none list-inside space-y-1 mt-1">
+                                ${classesToday.map(c => `
+                                    <li>
+                                        <button class="btn-open-attendance-class text-blue-600 hover:text-blue-800 hover:underline w-full text-left truncate"
+                                                data-class-id="${c.id}"
+                                                data-class-name="${c.name}"
+                                                data-date="${date_YYYY_MM_DD}">
+                                            - ${c.name}
+                                        </button>
+                                    </li>
+                                `).join('')}
+                            </ul>
+                            <div class="mt-1">
+                                <span class="font-medium">總點名: ${attendedCount} / ${studentsToday.length}</span>
+                                ${absenceCount > 0 ? `<span class="text-xs text-red-500 ml-1">(${absenceCount} 缺席)</span>` : ''}
+                                <div class="w-full bg-gray-200 rounded-full h-1.5 mt-1">
+                                    <div class="bg-blue-600 h-1.5 rounded-full" style="width: ${studentsToday.length > 0 ? (attendedCount / studentsToday.length * 100) : 0}%"></div>
+                                </div>
+                            </div>
+                        </div>
+                    ` : ''}
+                `;
+                
+                // 綁定點擊事件 (如果不是假日)
+                if (!holidayText) {
+                    // REQ 5: Main cell click listener removed. User must click a class.
+                    // cell.classList.add('cursor-pointer'); // No longer needed
+                }
+                
+                calendarGrid.appendChild(cell);
+            }
+            
+            // 7. 綁定按鈕
+            document.querySelectorAll('.btn-add-holiday').forEach(btn => {
+                btn.addEventListener('click', (e) => {
+                    e.stopPropagation(); // 防止觸發儲存格的點擊
+                    const date = e.currentTarget.dataset.date;
+                    document.getElementById('holiday-date').value = date;
+                    document.getElementById('holiday-date-display').textContent = date;
+                    document.getElementById('modal-add-holiday').classList.remove('hidden');
+                });
+            });
+            
+            // NEW: Req 5 - 綁定日曆上的班級點名按鈕
+            document.querySelectorAll('.btn-open-attendance-class').forEach(btn => {
+                btn.addEventListener('click', (e) => {
+                    e.stopPropagation(); // 防止觸發其他 (未來可能的) 儲存格點擊
+                    const classId = e.currentTarget.dataset.classId; // Use currentTarget
+                    const className = e.currentTarget.dataset.className;
+                    const date = e.currentTarget.dataset.date;
+                    
+                    // 找出這個班級的學生
+                    const studentsInThisClass = localStudents.filter(s => s.classId === classId);
+                    // 找出今天的出勤紀錄
+                    const attendanceToday = attendanceCache[date] || {};
+
+                    if (studentsInThisClass.length > 0) {
+                        openAttendanceModal(date, studentsInThisClass, attendanceToday, className); // Pass className
+                    } else {
+                        alert(`班級 ${className} 在 ${date} 沒有學生可點名。`);
+                    }
+                });
+            });
+            
+            // 8. 綁定刪除自訂假日
+            document.querySelectorAll('[data-date]').forEach(el => {
+                // 檢查是否為自訂假日的 span
+                if (el.tagName === 'DIV' && customHolidayMap.has(el.dataset.date)) {
+                    el.addEventListener('click', (e) => {
+                        e.stopPropagation();
+                        handleDeleteCustomHoliday(el.dataset.date);
+                    });
+                }
+            });
+        }
+        
+        async function handleAddCustomHoliday(e) {
+            e.preventDefault();
+            if (!isAuthReady) return;
+
+            const date = document.getElementById('holiday-date').value;
+            const description = document.getElementById('holiday-description').value;
+
+            if (!date || !description) {
+                alert("日期或事由未填寫。");
+                return;
+            }
+
+            try {
+                // 檢查是否已存在
+                const q = query(collection(db, getCollectionPath('customHolidays')), where("date", "==", date));
+                const snapshot = await getDocs(q);
+                if (!snapshot.empty) {
+                    // 更新
+                    const docRef = snapshot.docs[0].ref;
+                    await updateDoc(docRef, { description: description });
+                } else {
+                    // 新增
+                    await addDoc(collection(db, getCollectionPath('customHolidays')), {
+                        date: date,
+                        description: description
+                    });
+                }
+
+                document.getElementById('form-add-holiday').reset();
+                document.getElementById('modal-add-holiday').classList.add('hidden');
+                // onSnapshot will re-render calendar
+            } catch (error) {
+                console.error("Error adding custom holiday: ", error);
+            }
+        }
+        
+        async function handleDeleteCustomHoliday(date) {
+            if (!confirm(`確定要刪除 ${date} 的停課註記嗎？`)) {
+                return;
+            }
+            try {
+                const q = query(collection(db, getCollectionPath('customHolidays')), where("date", "==", date));
+                const snapshot = await getDocs(q);
+                const batch = writeBatch(db);
+                snapshot.forEach(doc => {
+                    batch.delete(doc.ref);
+                });
+                await batch.commit();
+                // onSnapshot will auto-update UI
+            } catch (error) {
+                console.error("Error deleting custom holiday:", error);
+            }
+        }
+        
+        // (Placeholder) 點名功能
+        // REQ 2 & 4: 實作點名 Modal
+        function openAttendanceModal(date, students, attendance, className = null) {
+            const modal = document.getElementById('modal-attendance');
+            const title = document.getElementById('attendance-modal-title');
+            const listContainer = document.getElementById('attendance-student-list');
+            
+            // REQ 5: Update title
+            title.textContent = className ? `點名 - ${date} (${className})` : `點名 - ${date}`;
+            listContainer.innerHTML = ''; // 清空
+            
+            // REQ 5: Modify class info display
+            if (className) {
+                const classInfo = document.createElement('p');
+                classInfo.className = "text-sm text-gray-600 mb-4";
+                classInfo.textContent = `班級: ${className}`;
+                listContainer.appendChild(classInfo);
+            } else {
+                // Fallback for old calls (if any)
+                const classIds = new Set(students.map(s => s.classId));
+                let classNames = [];
+                classIds.forEach(id => {
+                    const cls = localClasses.find(c => c.id === id);
+                    if (cls) classNames.push(cls.name);
+                });
+                
+                // 顯示班級名稱
+                const classInfo = document.createElement('p');
+                classInfo.className = "text-sm text-gray-600 mb-4";
+                classInfo.textContent = `班級: ${classNames.join(', ')}`;
+                listContainer.appendChild(classInfo);
+            }
+
+            students.forEach(student => {
+                const record = attendance[student.id];
+                const status = record ? record.status : '';
+                const reason = record ? record.reason : '';
+                
+                const li = document.createElement('div');
+                li.className = "student-attendance-item p-4 border rounded-lg mb-3 bg-gray-50";
+                li.dataset.studentId = student.id;
+                li.dataset.date = date;
+                li.dataset.recordId = record ? record.id : '';
+                
+                const statuses = [
+                    { value: 'present', label: '出席' },
+                    { value: 'sick', label: '病假' },
+                    { value: 'personal', label: '事假' },
+                    { value: 'bereavement', label: '喪假' },
+                    { value: 'other', label: '其他' }
+                ];
+                
+                // --- FIX: 修改為按鈕樣式 ---
+                let radioButtonsHtml = statuses.map(s => `
+                    <div>
+                        <input type="radio" 
+                               name="status-${student.id}" 
+                               value="${s.value}" 
+                               class="hidden peer attendance-status"
+                               id="status-${student.id}-${s.value}"
+                               ${status === s.value ? 'checked' : ''}>
+                        <label for="status-${student.id}-${s.value}"
+                               class="inline-block px-3 py-1.5 border border-gray-300 rounded-md text-sm font-medium cursor-pointer
+                                      transition-colors hover:bg-gray-100
+                                      peer-checked:bg-blue-600 peer-checked:text-white peer-checked:border-blue-600">
+                            ${s.label}
+                        </label>
+                    </div>
+                `).join('');
+
+                li.innerHTML = `
+                    <div class="flex justify-between items-center mb-2">
+                        <span class="font-medium text-lg">${student.name}</span>
+                        <span id="save-status-${student.id}" class="text-xs text-green-600 opacity-0 transition-opacity">已儲存</span>
+                    </div>
+                    <div class="flex flex-wrap gap-2 mb-2"> <!-- FIX: 修改 class -->
+                        ${radioButtonsHtml}
+                    </div>
+                    <div>
+                        <label class="text-xs font-medium text-gray-700">事由 (假單/其他):</label>
+                        <input type="text" 
+                               value="${reason}" 
+                               class="form-input w-full mt-1 px-3 py-1.5 border border-gray-300 rounded-md shadow-sm text-sm attendance-reason" 
+                               placeholder="輸入病假、事假、其他假的事由...">
+                    </div>
+                `;
+                listContainer.appendChild(li);
+            });
+            
+            // 綁定事件
+            listContainer.querySelectorAll('.attendance-status, .attendance-reason').forEach(input => {
+                input.addEventListener('change', handleSetAttendance);
+            });
+
+            modal.classList.remove('hidden');
+        }
+
+        // REQ 2 & 4: 處理點名儲存 (取代 handleToggleAttendance)
+        async function handleSetAttendance(e) {
+            const input = e.target;
+            const li = input.closest('.student-attendance-item');
+            if (!li) return;
+
+            const studentId = li.dataset.studentId;
+            const date = li.dataset.date;
+            let recordId = li.dataset.recordId;
+            
+            const statusRadio = li.querySelector(`input[name="status-${studentId}"]:checked`);
+            if (!statusRadio) return; // 如果還沒點選 (例如只是輸入事由)，暫不儲存
+            
+            const status = statusRadio.value;
+            const reason = li.querySelector('.attendance-reason').value;
+            
+            const statusIndicator = document.getElementById(`save-status-${studentId}`);
+            statusIndicator.textContent = "儲存中...";
+            statusIndicator.classList.remove('opacity-0', 'text-red-600');
+            statusIndicator.classList.add('text-green-600');
+
+            const docData = {
+                studentId: studentId,
+                date: date,
+                status: status,
+                reason: (status === 'present') ? "" : reason // 只有出席以外的狀態才儲存事由
+            };
+
+            try {
+                if (recordId) {
+                    // 更新
+                    await updateDoc(doc(db, getDocPath('attendance', recordId)), docData);
+                } else {
+                    // 新增
+                    const newDocRef = await addDoc(collection(db, getCollectionPath('attendance')), docData);
+                    li.dataset.recordId = newDocRef.id; // 非常重要：更新 recordId 以便下次更新
+                }
+                
+                statusIndicator.textContent = "已儲存";
+                setTimeout(() => statusIndicator.classList.add('opacity-0'), 2000); // 2秒後淡出
+
+            } catch (error) {
+                console.error("Error setting attendance:", error);
+                statusIndicator.textContent = "儲存失敗!";
+                statusIndicator.classList.remove('text-green-600');
+                statusIndicator.classList.add('text-red-600');
+            }
+        }
+
+        // --- 模組 6: 帳務加總 & 繳費狀態 (已更新支援 Family ID, 繳費日期, 備註) ---
+        
+        // NEW: 填充班級篩選器
+        function populateClassFilter() {
+            const selector = document.getElementById('billing-class-selector');
+            selector.innerHTML = '<option value="">所有班級</option>'; // Reset
+            
+            localClasses.forEach(cls => {
+                const option = document.createElement('option');
+                option.value = cls.id;
+                option.textContent = cls.name;
+                selector.appendChild(option);
+            });
+        }
+        
+        function initBillingPage() {
+            // REQ 1: 改為年/月下拉選單
+            const yearSelector = document.getElementById('billing-year-selector');
+            const monthSelector = document.getElementById('billing-month-selector');
+            
+            // const now = new Date(); // <-- REMOVED
+            // NEW: 使用 billingSettings (使用者設定) 或 (使用者指定的) 2025/11 作為預設
+            const defaultYear = billingSettings.defaultYear ? parseInt(billingSettings.defaultYear) : 2025; // <-- CHANGED
+            const defaultMonth = billingSettings.defaultMonth ? parseInt(billingSettings.defaultMonth) : 11; // 1-12 // <-- CHANGED
+
+            yearSelector.innerHTML = '';
+            // NEW: 產生年份選項，確保包含 defaultYear (User Request: 2025-2030)
+            const startYear = 2025; // <-- CHANGED
+            const endYear = 2030;   // <-- CHANGED
+            let yearRange = new Set();
+            for (let y = endYear; y >= startYear; y--) {
+                yearRange.add(y);
+            }
+            yearRange.add(defaultYear); // 確保預設年份存在
+            
+            const sortedYears = Array.from(yearRange).sort((a, b) => a - b); // 升序排列 (FIX: a - b)
+
+            sortedYears.forEach(y => {
+                const option = document.createElement('option');
+                option.value = y;
+                option.textContent = `${y} 年`;
+                option.selected = (y === defaultYear);
+                yearSelector.appendChild(option);
+            });
+            
+            monthSelector.innerHTML = '';
+            for (let m = 1; m <= 12; m++) {
+                const option = document.createElement('option');
+                option.value = m;
+                option.textContent = `${m} 月`;
+                option.selected = (m === defaultMonth);
+                monthSelector.appendChild(option);
+            }
+            
+            // NEW: 載入班級篩選
+            populateClassFilter();
+            
+            // 預設執行當月報表
+            runBillingReport(); // MODIFIED
+        }
+        
+        async function runBillingReport() {
+            if (!isAuthReady) return;
+            
+            // REQ 1: 從新的下拉選單讀取
+            const year = document.getElementById('billing-year-selector').value;
+            const month = document.getElementById('billing-month-selector').value;
+            const month_YYYY_MM = `${year}-${String(month).padStart(2, '0')}`;
+            
+            const selectedClassId = document.getElementById('billing-class-selector').value;
+            // NEW: Family ID
+            const mergeFamilies = document.getElementById('billing-merge-family').checked;
+            
+            if (!month_YYYY_MM) {
+                console.log("Billing report: No month selected yet.");
+                return;
+            }
+            
+            const tableBody = document.getElementById('billing-table-body');
+            tableBody.innerHTML = `<tr><td colspan="8" class="p-4 text-center">報表計算中...</td></tr>`; // NEW: colspan="8"
+
+            try {
+                // 1. 取得該月 *所有* 已存在的帳單紀錄
+                const qInvoices = query(
+                    collection(db, getCollectionPath('invoices')),
+                    where("month", "==", month_YYYY_MM)
+                );
+                const invoiceSnapshot = await getDocs(qInvoices);
+                
+                // 2. 建立報表 (pre-filter)
+                let report = [];
+                invoiceSnapshot.forEach(doc => {
+                    const invoice = { id: doc.id, ...doc.data() };
+                    const student = localStudents.find(s => s.id === invoice.studentId);
+                    
+                    const classFilterPassed = !selectedClassId || (student && student.classId === selectedClassId);
+                    
+                    if (student && (invoice.classCount > 0 || (invoice.extraFees && invoice.extraFees.length > 0)) && classFilterPassed) {
+                        report.push({
+                            student: student,
+                            classCount: invoice.classCount || 0,
+                            totalAmount: invoice.amount || 0,
+                            isPaid: invoice.isPaid || false,
+                            paymentDate: invoice.paymentDate || null, // NEW
+                            paymentNotes: invoice.paymentNotes || "", // NEW
+                            invoiceId: invoice.id,
+                            extraFees: invoice.extraFees || []
+                        });
+                    }
+                });
+                
+                // 3. NEW: 處理合併
+                let finalReportData = {};
+                if (mergeFamilies) {
+                    report.forEach(item => {
+                        const familyId = item.student.familyId;
+                        const key = (familyId && familyId.trim() !== "") ? `family_${familyId}` : `student_${item.student.id}`;
+                        
+                        if (!finalReportData[key]) {
+                            finalReportData[key] = {
+                                students: [],
+                                contacts: new Set(),
+                                classCount: 0,
+                                totalAmount: 0,
+                                isPaid: true,
+                                paymentDate: null, // NEW
+                                paymentNotes: "", // NEW
+                                invoiceIds: [],
+                                extraFees: [],
+                                isGroup: (key.startsWith('family_'))
+                            };
+                        }
+                        
+                        const group = finalReportData[key];
+                        group.students.push(item.student);
+                        if (item.student.parentContact) {
+                            group.contacts.add(item.student.parentContact);
+                        }
+                        group.classCount += item.classCount;
+                        group.totalAmount += item.totalAmount;
+                        group.isPaid = group.isPaid && item.isPaid; // 必須全部
+                        group.invoiceIds.push(item.invoiceId);
+                        group.extraFees = group.extraFees.concat(item.extraFees);
+                        
+                        // NEW: 匯總付款資訊 (取第一個找到的)
+                        if (item.isPaid) {
+                            group.paymentDate = group.paymentDate || item.paymentDate;
+                            group.paymentNotes = group.paymentNotes || item.paymentNotes;
+                        }
+                    });
+                } else {
+                    // 不合併，直接轉換
+                    report.forEach(item => {
+                        finalReportData[`student_${item.student.id}`] = {
+                            students: [item.student],
+                            contacts: new Set([item.student.parentContact || 'N/A']),
+                            classCount: item.classCount,
+                            totalAmount: item.totalAmount,
+                            isPaid: item.isPaid,
+                            paymentDate: item.paymentDate, // NEW
+                            paymentNotes: item.paymentNotes, // NEW
+                            invoiceIds: [item.invoiceId],
+                            extraFees: item.extraFees,
+                            isGroup: false
+                        };
+                    });
+                }
+
+                // 4. 渲染報表
+                tableBody.innerHTML = '';
+                let totalPayable = 0;
+                let totalPaid = 0;
+                
+                const reportItems = Object.values(finalReportData);
+                
+                if (reportItems.length === 0) {
+                    tableBody.innerHTML = `<tr><td colspan="8" class="p-4 text-center text-gray-500">此月份無任何手動輸入的學費紀錄。</td></tr>`; // NEW: colspan="8"
+                    // 更新總計
+                    document.getElementById('billing-total-payable').textContent = '$0';
+                    document.getElementById('billing-total-paid').textContent = '$0';
+                    return;
+                }
+
+                for (const group of reportItems) {
+                    const totalAmount = group.totalAmount;
+                    const isPaid = group.isPaid;
+                    const paymentDate = group.paymentDate || ''; // NEW
+                    const paymentNotes = group.paymentNotes || ''; // NEW
+                    
+                    totalPayable += totalAmount;
+                    if (isPaid) totalPaid += totalAmount;
+                    
+                    const studentNames = group.students.map(s => s.name).join(', ');
+                    const contactInfo = Array.from(group.contacts).join(', ') || 'N/A';
+                    const allInvoiceIds = group.invoiceIds.join(','); // NEW: 取得所有 ID
+                    
+                    // 顯示雜費提示
+                    const extraFeesTotal = group.extraFees.reduce((sum, f) => sum + f.amount, 0);
+                    const extraFeesText = extraFeesTotal > 0 ? 
+                        `<span class="text-xs text-gray-500 block">(含雜費 $${extraFeesTotal})</span>` : '';
+                    
+                    // 產生通知按鈕 (MODIFIED: 合併時啟用)
+                    let noticeButtonHtml = '';
+                    if (group.isGroup) {
+                        noticeButtonHtml = `<button class="btn-gen-notice text-xs bg-purple-600 text-white px-2 py-1 rounded hover:bg-purple-700"
+                            data-is-group="true" 
+                            data-invoice-ids="${allInvoiceIds}" 
+                            data-name="${studentNames}" 
+                            data-month-str="${month_YYYY_MM}"
+                            data-count="${group.classCount}"
+                            data-amount="${totalAmount}">
+                            產生(合併)通知
+                        </button>`;
+                    } else {
+                        // const student = group.students[0]; // No longer needed
+                        noticeButtonHtml = `<button class="btn-gen-notice text-xs bg-gray-500 text-white px-2 py-1 rounded hover:bg-gray-600"
+                            data-is-group="false" 
+                            data-invoice-ids="${allInvoiceIds}" 
+                            data-name="${studentNames}"
+                            data-month-str="${month_YYYY_MM}"
+                            data-count="${group.classCount}"
+                            data-amount="${totalAmount}">
+                            產生通知
+                        </button>`;
+                    }
+
+                    const tr = document.createElement('tr');
+                    tr.className = isPaid ? "bg-green-50" : "bg-white";
+                    tr.innerHTML = `
+                        <td class="p-3 border-b">
+                            ${group.isGroup ? 
+                                `<span class="font-medium">${studentNames}</span>` : 
+                                `<a href="#" class="text-blue-600 hover:underline font-medium btn-gen-notice"
+                                    data-is-group="false" 
+                                    data-invoice-ids="${allInvoiceIds}" 
+                                    data-name="${studentNames}"
+                                    data-month-str="${month_YYYY_MM}"
+                                    data-count="${group.classCount}"
+                                    data-amount="${totalAmount}">
+                                    ${studentNames}
+                                </a>`
+                            }
+                        </td>
+                        <td class="p-3 border-b text-sm text-gray-700">${contactInfo}</td>
+                        <td class="p-3 border-b">${group.isGroup ? 'N/A' : `$${group.students[0].fee}`}</td>
+                        <td class="p-3 border-b">${group.classCount} 堂</td>
+                        <td class="p-3 border-b font-semibold text-blue-700">
+                            $${totalAmount}
+                            ${extraFeesText}
+                        </td>
+                        <td class="p-3 border-b">
+                            <input type="checkbox" 
+                                class="form-checkbox h-5 w-5 text-blue-600 rounded payment-checkbox" 
+                                ${isPaid ? 'checked' : ''}
+                                data-invoice-ids="${group.invoiceIds.join(',')}"
+                                data-month="${month_YYYY_MM}">
+                            ${isPaid ? `<span class="text-xs text-green-600 ml-1 block">(${paymentDate || 'N/A'})</span>` : ''}
+                        </td>
+                        <td class="p-3 border-b text-sm text-gray-700">
+                            <span class="note-display block">${paymentNotes || ''}</span>
+                            <button class="btn-edit-payment-details text-blue-500 hover:underline text-xs"
+                                    data-invoice-ids="${group.invoiceIds.join(',')}"
+                                    data-date="${paymentDate}"
+                                    data-notes="${paymentNotes}">
+                                [編輯備註/日期]
+                            </button>
+                        </td>
+                        <td class="p-3 border-b">
+                            ${noticeButtonHtml}
+                        </td>
+                    `;
+                    tableBody.appendChild(tr);
+                }
+                
+                // 更新總計
+                document.getElementById('billing-total-payable').textContent = `$${totalPayable}`;
+                document.getElementById('billing-total-paid').textContent = `$${totalPaid}`;
+
+                // 綁定繳費勾選事件
+                document.querySelectorAll('.payment-checkbox').forEach(cb => {
+                    cb.addEventListener('change', handleTogglePayment);
+                });
+                // 綁定通知按鈕 (包含學生姓名連結)
+                document.querySelectorAll('.btn-gen-notice').forEach(btn => {
+                    btn.addEventListener('click', (e) => {
+                        e.preventDefault(); // 阻止 <a> 連結的預設跳轉行為
+                        generateTuitionNotice(e);
+                    });
+                });
+                // NEW: 綁定編輯備註按鈕
+                document.querySelectorAll('.btn-edit-payment-details').forEach(btn => {
+                    btn.addEventListener('click', handleEditPaymentDetails);
+                });
+
+            } catch (error) {
+                console.error("Error running billing report:", error);
+                tableBody.innerHTML = `<tr><td colspan="8" class="p-4 text-center text-red-500">執行報表時發生錯誤: ${error.message}</td></tr>`; // NEW: colspan="8"
+            }
+        }
+        
+        // --- NEW: 繳費日期/備註相關函數 ---
+        
+        /**
+         * 核心 Firestore 更新函數
+         */
+        async function updatePaymentStatus(invoiceIds, isPaid, paymentDate, paymentNotes) {
+            if (!isAuthReady) return;
+
+            try {
+                const batch = writeBatch(db);
+                invoiceIds.forEach(id => {
+                    if (id) { // 確保 ID 不是空字串
+                        const docRef = doc(db, getDocPath('invoices', id));
+                        batch.update(docRef, { 
+                            isPaid: isPaid,
+                            paymentDate: paymentDate || null,
+                            paymentNotes: paymentNotes || ""
+                        });
+                    }
+                });
+                await batch.commit();
+                
+                // 重新執行報表以更新總計和 UI
+                runBillingReport();
+            } catch (error) {
+                console.error("Error updating payment status: ", error);
+                alert("更新繳費狀態失敗！");
+            }
+        }
+
+        /**
+         * (NEW) 處理 "已繳費" 核取方塊的點擊
+         */
+        function handleTogglePayment(e) {
+            const checkbox = e.target;
+            const invoiceIds = checkbox.dataset.invoiceIds.split(',');
+            
+            if (checkbox.checked) {
+                // --- 標記為已繳 ---
+                // 1. 先取消勾選，由 Modal 儲存後觸發 Rerender 來勾選
+                checkbox.checked = false;
+                // 2. 開啟 Modal，預設為今天
+                const today = new Date().toISOString().split('T')[0];
+                openPaymentDetailsModal(invoiceIds, today, '');
+                
+            } else {
+                // --- 標記為未繳 ---
+                // 1. 顯示確認視窗
+                const modal = document.getElementById('modal-confirm');
+                document.getElementById('confirm-title').textContent = "確認標記為未繳費";
+                document.getElementById('confirm-message').textContent = "確定要清除此項目的付款日期和備註，並標記為未繳費嗎？";
+                
+                const confirmBtn = document.getElementById('btn-confirm-action');
+                const newConfirmBtn = confirmBtn.cloneNode(true);
+                newConfirmBtn.className = "bg-red-600 text-white px-4 py-2 rounded-md hover:bg-red-700"; // 確保樣式
+                newConfirmBtn.textContent = "確認清除";
+                confirmBtn.parentNode.replaceChild(newConfirmBtn, confirmBtn);
+
+                newConfirmBtn.addEventListener('click', async () => {
+                    await updatePaymentStatus(invoiceIds, false, null, "");
+                    modal.classList.add('hidden');
+                }, { once: true }); // 確保只觸發一次
+
+                // 綁定取消按鈕 (如果取消，要重新勾選)
+                const cancelBtn = document.getElementById('btn-confirm-cancel');
+                const newCancelBtn = cancelBtn.cloneNode(true);
+                cancelBtn.parentNode.replaceChild(newCancelBtn, cancelBtn);
+                newCancelBtn.addEventListener('click', () => {
+                    checkbox.checked = true; // 恢復勾選
+                    modal.classList.add('hidden');
+                }, { once: true });
+
+                modal.classList.remove('hidden');
+            }
+        }
+        
+        /**
+         * (NEW) 處理 [編輯備註/日期] 按鈕的點擊
+         */
+        function handleEditPaymentDetails(e) {
+            const btn = e.currentTarget;
+            const invoiceIds = btn.dataset.invoiceIds.split(',');
+            const date = btn.dataset.date;
+            const notes = btn.dataset.notes;
+            
+            openPaymentDetailsModal(invoiceIds, date, notes);
+        }
+
+        /**
+         * (NEW) 開啟繳費詳情 Modal
+         */
+        function openPaymentDetailsModal(invoiceIds, date, notes) {
+            const modal = document.getElementById('modal-payment-details');
+            
+            document.getElementById('payment-modal-invoice-ids').value = invoiceIds.join(',');
+            
+            // 如果日期為空或 'null'，預設為今天
+            const today = new Date().toISOString().split('T')[0];
+            document.getElementById('payment-date').value = (date && date !== 'null') ? date : today;
+            
+            document.getElementById('payment-notes').value = (notes && notes !== 'null') ? notes : '';
+            
+            modal.classList.remove('hidden');
+        }
+
+        /**
+         * (NEW) 處理 Modal 中的 "儲存"
+         */
+        async function handleSavePayment() {
+            const modal = document.getElementById('modal-payment-details');
+            const invoiceIds = document.getElementById('payment-modal-invoice-ids').value.split(',');
+            const paymentDate = document.getElementById('payment-date').value;
+            const paymentNotes = document.getElementById('payment-notes').value;
+
+            if (!paymentDate) {
+                alert('請選擇繳費日期。');
+                return;
+            }
+
+            const btn = document.getElementById('btn-save-payment-details');
+            btn.disabled = true;
+            btn.textContent = "儲存中...";
+
+            try {
+                await updatePaymentStatus(invoiceIds, true, paymentDate, paymentNotes);
+                modal.classList.add('hidden');
+            } catch (error) {
+                console.error("Error saving payment details:", error);
+            } finally {
+                btn.disabled = false;
+                btn.textContent = "儲存 (標記為已繳)";
+            }
+        }
+
+        /**
+         * (NEW) 處理 Modal 中的 "標記為未繳費"
+         */
+        async function handleMarkUnpaid() {
+            const modal = document.getElementById('modal-payment-details');
+            const invoiceIds = document.getElementById('payment-modal-invoice-ids').value.split(',');
+            
+            const btn = document.getElementById('btn-mark-unpaid');
+            btn.disabled = true;
+            btn.textContent = "處理中...";
+            
+            try {
+                await updatePaymentStatus(invoiceIds, false, null, "");
+                modal.classList.add('hidden');
+            } catch (error) {
+                console.error("Error marking as unpaid:", error);
+            } finally {
+                btn.disabled = false;
+                btn.textContent = "標記為未繳費";
+            }
+        }
+
+        // --- 模組 7: 生成學費通知 (已更新支援雜費 & 合併) ---
+        async function generateTuitionNotice(e) { // 設為 async
+            const btn = e.currentTarget; 
+            const isGroup = btn.dataset.isGroup === 'true';
+            const invoiceIds = btn.dataset.invoiceIds ? btn.dataset.invoiceIds.split(',') : [];
+            const studentNames = btn.dataset.name; // 學生姓名 (可能是單一或多個)
+            const [year, month] = btn.dataset.monthStr.split('-');
+            
+            if (!invoiceIds || invoiceIds.length === 0) {
+                alert("找不到帳單資料，請先為此學生/群組儲存堂數。");
+                return;
+            }
+
+            // NEW: 取得完整的帳單資料 (支援多筆)
+            let allInvoices = [];
+            try {
+                for (const id of invoiceIds) {
+                    const docRef = doc(db, getDocPath('invoices', id));
+                    const docSnap = await getDoc(docRef);
+                    if (docSnap.exists()) {
+                        allInvoices.push(docSnap.data());
+                    }
+                }
+                if (allInvoices.length === 0) {
+                    alert("找不到任何帳單資料。");
+                    return;
+                }
+            } catch (err) {
+                console.error("Error fetching invoices:", err);
+                alert("讀取帳單失敗。");
+                return;
+            }
+
+            // NEW: 匯總資料
+            let totalClassCount = 0;
+            let totalAmount = 0;
+            let totalTuitionAmount = 0;
+            let allExtraFees = []; // { name, amount, studentName }
+
+            allInvoices.forEach(invoice => {
+                totalClassCount += invoice.classCount || 0;
+                totalAmount += invoice.amount || 0;
+                totalTuitionAmount += invoice.tuitionAmount || 0;
+                if (invoice.extraFees) {
+                    const student = localStudents.find(s => s.id === invoice.studentId);
+                    const studentNameForFee = student ? student.name : 'N/A';
+                    invoice.extraFees.forEach(fee => {
+                        allExtraFees.push({ ...fee, studentName: studentNameForFee }); // 附加學生姓名
+                    });
+                }
+            });
+            
+            // NEW: 決定家長稱謂
+            const parentName = isGroup ? 
+                `${studentNames.split(',')[0].substring(0, 1)} 同學的家長` : // e.g., "王, 林" -> "王 同學的家長"
+                `${studentNames.substring(0, 1)} 同學的家長`; // e.g., "王小明" -> "王 同學的家長"
+
+            // 1. 產生包含雜費明細的通知
+            // let details = `本月學費 (共 ${totalClassCount} 堂)：$${totalTuitionAmount} 元\n`; // OLD
+            
+            // --- NEW: Req 1 - 產生學費明細 ---
+            let details = "";
+            
+            // 1a. 個別學費明細
+            if (isGroup) {
+                // (群組) 顯示個別學費
+                details += "本月學費 (個別)：\n";
+                allInvoices.forEach(invoice => {
+                    const student = localStudents.find(s => s.id === invoice.studentId);
+                    const studentName = student ? student.name : 'N/A';
+                    details += `  - ${studentName} (共 ${invoice.classCount || 0} 堂): $${invoice.tuitionAmount || 0}\n`;
+                });
+                details += `學費小計：$${totalTuitionAmount} 元\n`; // 加上學費小計
+            } else {
+                // (單一學生) 
+                details += `本月學費 (共 ${totalClassCount} 堂)：$${totalTuitionAmount} 元\n`;
+            }
+            // --- END NEW ---
+
+            let extraFeesText = ""; // 供模板使用
+            let extraFeesDetail = ""; // 供模板使用
+
+            // 1b. 雜費明細
+            if (allExtraFees.length > 0) {
+                const extraFeesTotal = allExtraFees.reduce((sum, f) => sum + f.amount, 0);
+                extraFeesText = `$${extraFeesTotal} 元`;
+                
+                // 加上 "本月雜費" 標題 (並加上換行)
+                if (isGroup) {
+                    details += `\n本月雜費：$${extraFeesTotal} 元\n`;
+                } else {
+                    details += `本月雜費：$${extraFeesTotal} 元\n`;
+                }
+                
+                allExtraFees.forEach(f => {
+                    const studentPrefix = isGroup ? `(${f.studentName}) ` : ''; // 如果是群組，才顯示學生前綴
+                    details += `  - ${studentPrefix}${f.name}: $${f.amount}\n`;
+                    extraFeesDetail += `${studentPrefix}${f.name} ($${f.amount}) `;
+                });
+            } else {
+                extraFeesText = "$0 元";
+            }
+
+            const noticeText = `
+${parentName} 您好：
+
+通知您 ${studentNames} 同學 ${year} 年 ${month} 月的學費帳單。
+
+${details.trim()}
+
+---------------------
+應繳總金額為： $${totalAmount} 元
+
+感謝您！
+            `.trim();
+
+            const modal = document.getElementById('modal-notification');
+            const content = document.getElementById('notification-content');
+            const templateNameInput = document.getElementById('template-name');
+            
+            // 儲存目前通知的資料到 modal 上
+            modal.dataset.studentName = studentNames; // 可能是多個
+            modal.dataset.parentName = parentName;
+            modal.dataset.year = year;
+            modal.dataset.month = month;
+            modal.dataset.classCount = totalClassCount;
+            modal.dataset.amount = totalAmount; // 總金額
+            modal.dataset.defaultNotice = noticeText;
+            
+            // NEW: 儲存新欄位供模板使用
+            modal.dataset.tuitionAmount = totalTuitionAmount;
+            modal.dataset.extraFeesAmount = allExtraFees.reduce((sum, f) => sum + f.amount, 0);
+            modal.dataset.extraFeesDetail = extraFeesDetail.trim() || "無";
+
+            // 2. 填入一次性內容
+            content.value = noticeText;
+            templateNameInput.value = "";
+            templateNameInput.dataset.templateId = "";
+            
+            // 3. 載入模板下拉選單
+            loadTemplatesToDropdown();
+            
+            modal.classList.remove('hidden');
+        }
+        
+        // NEW: 載入模板至下拉選單
+        function loadTemplatesToDropdown() {
+            const select = document.getElementById('template-select');
+            select.innerHTML = '<option value="">--- 選擇已存模板 (或使用目前內容) ---</option>';
+            
+            localTemplates.forEach(template => {
+                const option = document.createElement('option');
+                option.value = template.id;
+                option.textContent = template.name;
+                select.appendChild(option);
+            });
+        }
+        
+        // NEW: 處理模板選擇 (已更新支援雜費)
+        function handleTemplateSelect(e) {
+            const templateId = e.target.value;
+            const modal = document.getElementById('modal-notification');
+            const content = document.getElementById('notification-content');
+            const templateNameInput = document.getElementById('template-name');
+            
+            // 從 modal 讀取學生資料
+            const { 
+                studentName, 
+                parentName, 
+                year, 
+                month, 
+                classCount, 
+                amount, 
+                defaultNotice,
+                tuitionAmount,      // NEW
+                extraFeesAmount,    // NEW
+                extraFeesDetail     // NEW
+            } = modal.dataset;
+
+            if (!templateId) {
+                // 還原為預設的一次性通知
+                content.value = defaultNotice || "";
+                templateNameInput.value = "";
+                templateNameInput.dataset.templateId = "";
+                return;
+            }
+            
+            const template = localTemplates.find(t => t.id === templateId);
+            if (template) {
+                // 執行模板替換
+                let replacedContent = template.content;
+                replacedContent = replacedContent.replace(/{家長姓名}/g, parentName);
+                replacedContent = replacedContent.replace(/{學生姓名}/g, studentName);
+                replacedContent = replacedContent.replace(/{年份}/g, year);
+                replacedContent = replacedContent.replace(/{月份}/g, month);
+                replacedContent = replacedContent.replace(/{上課堂數}/g, classCount);
+                replacedContent = replacedContent.replace(/{應繳金額}/g, `$${amount}`);
+                
+                // NEW: 替換新欄位
+                replacedContent = replacedContent.replace(/{學費金額}/g, `$${tuitionAmount || 0}`);
+                replacedContent = replacedContent.replace(/{雜費金額}/g, `$${extraFeesAmount || 0}`);
+                replacedContent = replacedContent.replace(/{雜費明細}/g, extraFeesDetail || "無");
+                
+                content.value = replacedContent;
+                templateNameInput.value = template.name;
+                templateNameInput.dataset.templateId = template.id;
+            }
+        }
+
+        // NEW: 處理儲存模板
+        async function handleSaveTemplate() {
+            if (!isAuthReady) return;
+            
+            const contentInput = document.getElementById('notification-content');
+            const nameInput = document.getElementById('template-name');
+            
+            const content = contentInput.value;
+            const name = nameInput.value;
+            const templateId = nameInput.dataset.templateId;
+
+            if (!name || !content) {
+                alert("請輸入模板名稱和內容。");
+                return;
+            }
+
+            const btn = document.getElementById('btn-save-template');
+            btn.disabled = true;
+            btn.textContent = "儲存中...";
+
+            try {
+                if (templateId) {
+                    // 更新
+                    const docRef = doc(db, getDocPath('notificationTemplates', templateId));
+                    await updateDoc(docRef, { name: name, content: content });
+                } else {
+                    // 新增
+                    await addDoc(collection(db, getCollectionPath('notificationTemplates')), {
+                        name: name,
+                        content: content
+                    });
+                }
+                
+                alert("模板已儲存！");
+                nameInput.value = "";
+                contentInput.value = "";
+                nameInput.dataset.templateId = "";
+                loadTemplatesToDropdown();
+                
+            } catch (error) {
+                console.error("Error saving template:", error);
+                alert("儲存失敗！");
+            } finally {
+                btn.disabled = false;
+                btn.textContent = "儲存為模板";
+            }
+        }
+        
+        // NEW: 處理刪除模板
+        async function handleDeleteTemplate() {
+            if (!isAuthReady) return;
+
+            const select = document.getElementById('template-select');
+            const templateId = select.value;
+            
+            if (!templateId) {
+                alert("請先從下拉選單選擇一個要刪除的模板。");
+                return;
+            }
+
+            if (!confirm("確定要刪除這個模板嗎？")) {
+                return;
+            }
+            
+            try {
+                await deleteDoc(doc(db, getDocPath('notificationTemplates', templateId)));
+                
+                alert("模板已刪除。");
+                document.getElementById('notification-content').value = "";
+                document.getElementById('template-name').value = "";
+                document.getElementById('template-name').dataset.templateId = "";
+                
+            } catch (error) {
+                console.error("Error deleting template:", error);
+                alert("刪除失敗！");
+            }
+        }
+
+        // 複製通知
+        document.getElementById('btn-copy-notice').addEventListener('click', () => {
+            const content = document.getElementById('notification-content');
+            content.select();
+            // 使用舊方法以確保在 iframe 中運作
+            try {
+                document.execCommand('copy');
+                alert("已複製到剪貼簿！");
+            } catch (err) {
+                alert("複製失敗，請手動複製。");
+            }
+        });
+
+        // --- 啟動應用程式 ---
+        document.addEventListener('DOMContentLoaded', () => {
+            initFirebase();
+        });
+
+    </script>
+    
+    <!-- 自訂字體與樣式 -->
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+        body {
+            font-family: 'Inter', 'Noto Sans TC', sans-serif;
+        }
+        /* 隱藏滾動條但保留滾動功能 */
+        .no-scrollbar::-webkit-scrollbar {
+            display: none;
+        }
+        .no-scrollbar {
+            -ms-overflow-style: none; /* IE and Edge */
+            scrollbar-width: none; /* Firefox */
+        }
+        /* 頁面切換過渡 */
+        .page {
+            animation: fadeIn 0.3s ease-in-out;
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+    </style>
+</head>
+
+<body class="bg-gray-100">
+
+    <!-- 全螢幕載入中遮罩 -->
+    <div id="loading-overlay" class="fixed inset-0 bg-white z-50 flex items-center justify-center text-xl font-semibold">
+        系統載入中...
+    </div>
+
+    <!-- NEW: 手動設定 Firebase Modal -->
+    <div id="modal-setup-firebase" class="fixed inset-0 bg-gray-900 bg-opacity-90 flex items-center justify-center z-50 hidden">
+        <div class="bg-white p-8 rounded-lg shadow-2xl w-full max-w-2xl">
+            <div class="mb-6 text-center">
+                <svg class="mx-auto h-12 w-12 text-yellow-400" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
+                  <path stroke-linecap="round" stroke-linejoin="round" d="M11.42 15.17L17.25 21A2.652 2.652 0 0021 17.25l-5.877-5.877M11.42 15.17l2.496-3.03c.317-.384.74-.626 1.208-.766M11.42 15.17l-4.655 5.653a2.548 2.548 0 11-3.586-3.586l6.837-5.63m5.108-.233c.55-.164 1.163-.188 1.743-.14a4.5 4.5 0 004.486-6.336l-3.276 3.277a3.004 3.004 0 01-2.25-2.25l3.276-3.276a4.5 4.5 0 00-6.336 4.486c.091 1.076-.071 2.264-.904 2.95l-.102.085m-1.745 1.437L5.909 7.5H4.5L2.25 3.75l1.5-1.5L7.5 4.5v1.409l4.26 4.26m-1.745 1.437l1.745-1.437m6.615 8.206L15.75 15.75M4.867 19.125h.008v.008h-.008v-.008z" />
+                </svg>
+                <h2 class="text-2xl font-bold text-gray-900 mt-2">需要 Firebase 設定</h2>
+                <p id="setup-error-message" class="text-red-600 font-medium mt-2">找不到有效的環境變數。</p>
+                <p class="text-gray-600 mt-2 text-sm">如果您是第一次使用，請貼上您的 Firebase Config JSON。</p>
+            </div>
+            
+            <div class="mb-4">
+                <label for="firebase-config-input" class="block text-sm font-medium text-gray-700 mb-1">Firebase Config JSON:</label>
+                <textarea id="firebase-config-input" rows="8" class="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm font-mono text-xs" placeholder='{
+  "apiKey": "...",
+  "authDomain": "...",
+  "projectId": "...",
+  "storageBucket": "...",
+  "messagingSenderId": "...",
+  "appId": "..."
+}'></textarea>
+                <p class="text-xs text-gray-500 mt-1">設定將會儲存在您的瀏覽器 (localStorage) 中。</p>
+            </div>
+            
+            <div class="flex justify-end space-x-3">
+                <button id="btn-save-config" class="bg-blue-600 text-white px-6 py-2 rounded-md hover:bg-blue-700 font-medium">
+                    儲存並重新載入
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 頂部導覽列 -->
+    <nav class="bg-gray-800 shadow-md">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="flex items-center justify-between h-16">
+                <!-- 左側: Logo 與標題 -->
+                <div class="flex items-center">
+                    <div class="flex-shrink-0">
+                        <!--  -->
+                        <svg class="h-8 w-8 text-blue-400" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
+                          <path stroke-linecap="round" stroke-linejoin="round" d="M15.75 15.75l-2.489-2.489m0 0a3.375 3.375 0 10-4.773-4.773 3.375 3.375 0 004.774 4.774zM21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                        </svg>
+                    </div>
+                    <div class="ml-3">
+                        <h1 class="text-white text-lg font-bold">學費與班級管理系統</h1>
+                    </div>
+                </div>
+                
+                <!-- 中間: 導覽按鈕 -->
+                <div class="hidden md:block">
+                    <div class="ml-10 flex items-baseline space-x-4">
+                        <button id="nav-classes" class="text-gray-300 hover:bg-gray-700 hover:text-white px-3 py-2 rounded-md text-sm font-medium">
+                            班級管理
+                        </button>
+                        <button id="nav-calendar" class="text-gray-300 hover:bg-gray-700 hover:text-white px-3 py-2 rounded-md text-sm font-medium">
+                            日曆課表
+                        </button>
+                        <button id="nav-billing" class="text-gray-300 hover:bg-gray-700 hover:text-white px-3 py-2 rounded-md text-sm font-medium">
+                            帳務報表
+                        </button>
+                    </div>
+                </div>
+                
+                <!-- 右側: 認證狀態 -->
+                <div id="auth-state" class="text-right">
+                    <p class="text-xs text-red-500">狀態：連線中...</p>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <!-- 頁面容器 -->
+    <main class="max-w-7xl mx-auto py-6 px-4 sm:px-6 lg:px-8">
+        
+        <!-- 頁面 1: 班級管理 (預設顯示) -->
+        <div id="page-classes" class="page">
+            <div class="flex justify-between items-center mb-6">
+                <h2 class="text-2xl font-semibold text-gray-900">班級總覽</h2>
+                <button id="btn-show-add-class" class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-lg shadow-md transition-colors">
+                    + 新增班級
+                </button>
+            </div>
+            
+            <div id="class-list-container" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                <!-- 班級卡片將由 JS 動態載入 -->
+            </div>
+        </div>
+
+        <!-- 頁面 2: 日曆課表 -->
+        <div id="page-calendar" class="page hidden">
+            <div class="bg-white p-6 rounded-lg shadow-md">
+                <!-- 日曆控制項 -->
+                <div id="calendar-controls" data-year="" data-month="" class="flex justify-between items-center mb-4">
+                    <button id="btn-prev-month" class="bg-gray-200 hover:bg-gray-300 text-gray-800 font-bold p-2 rounded-full">
+                        <svg class="h-5 w-5" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M15.75 19.5L8.25 12l7.5-7.5" /></svg>
+                    </button>
+                    <h2 id="calendar-month-title" class="text-xl font-semibold"></h2>
+                    <button id="btn-next-month" class="bg-gray-200 hover:bg-gray-300 text-gray-800 font-bold p-2 rounded-full">
+                        <svg class="h-5 w-5" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M8.25 4.5l7.5 7.5-7.5 7.5" /></svg>
+                    </button>
+                </div>
+                
+                <!-- 日曆星期 -->
+                <div class="grid grid-cols-7 gap-px text-center font-semibold text-sm text-gray-600 mb-1">
+                    <div>日</div>
+                    <div>一</div>
+                    <div>二</div>
+                    <div>三</div>
+                    <div>四</div>
+                    <div>五</div>
+                    <div>六</div>
+                </div>
+                
+                <!-- 日曆網格 -->
+                <div id="calendar-grid" class="grid grid-cols-7 gap-px bg-gray-200 border border-gray-200">
+                    <!-- 日期格子將由 JS 動態載入 -->
+                </div>
+                
+                <!-- *** FIX: 帳務報表的 HTML 已從此處移除 *** -->
+                
+            </div>
+        </div>
+        
+        <!-- *** FIX: 頁面 3: 帳務報表 (將錯誤的 HTML 移至此處) *** -->
+        <div id="page-billing" class="page hidden">
+            <div class="bg-white p-6 rounded-lg shadow-md">
+                <div class="flex flex-col md:flex-row justify-between md:items-center mb-4 space-y-4 md:space-y-0">
+                    <h2 class="text-2xl font-semibold text-gray-900">帳務報表</h2>
+                    
+                    <!-- NEW: 篩選器容器 -->
+                    <div class="flex flex-col sm:flex-row sm:items-center sm:space-x-4 space-y-2 sm:space-y-0">
+                        <div>
+                            <label for="billing-class-selector" class="text-sm font-medium">篩選班級：</label>
+                            <select id="billing-class-selector" class="form-select rounded-md shadow-sm border-gray-300">
+                                <option value="">所有班級</option>
+                                <!-- JS 載入 -->
+                            </select>
+                        </div>
+                        
+                        <!-- REQ 1: 改為年/月下拉選單 -->
+                        <div>
+                            <label for="billing-year-selector" class="text-sm font-medium">選擇年份：</label>
+                            <select id="billing-year-selector" class="form-select rounded-md shadow-sm border-gray-300"></select>
+                        </div>
+                        <div>
+                            <label for="billing-month-selector" class="text-sm font-medium">選擇月份：</label>
+                            <select id="billing-month-selector" class="form-select rounded-md shadow-sm border-gray-300"></select>
+                        </div>
+                        <!-- NEW: 儲存預設按鈕 -->
+                        <div>
+                            <button id="btn-save-billing-default" class="bg-blue-500 text-white px-3 py-1.5 rounded-md text-sm hover:bg-blue-600" title="將目前選擇的年/月儲存為預設值">
+                                設為預設
+                            </button>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- NEW: 合併 Family ID -->
+                <div class="mb-4">
+                    <label class="flex items-center space-x-2">
+                        <input type="checkbox" id="billing-merge-family" class="form-checkbox h-5 w-5 text-blue-600 rounded">
+                        <span class="text-sm font-medium text-gray-700">合併相同 Family ID 的帳單</span>
+                    </label>
+                </div>
+
+                <!-- 總計 -->
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
+                    <div class="bg-blue-50 p-4 rounded-lg">
+                        <p class="text-sm font-medium text-blue-700">本月應收總額</p>
+                        <p id="billing-total-payable" class="text-2xl font-bold text-blue-900">$0</p>
+                    </div>
+                    <div class="bg-green-50 p-4 rounded-lg">
+                        <p class="text-sm font-medium text-green-700">本月實收總額</p>
+                        <p id="billing-total-paid" class="text-2xl font-bold text-green-900">$0</p>
+                    </div>
+                </div>
+
+                <!-- 帳務表格 -->
+                <div class="overflow-x-auto">
+                    <table class="min-w-full divide-y divide-gray-200">
+                        <thead class="bg-gray-50">
+                            <tr>
+                                <th class="p-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">學生</th>
+                                <th class="p-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">聯絡人</th>
+                                <th class="p-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">單堂費</th>
+                                <th class="p-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">出席堂數</th>
+                                <th class="p-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">應繳金額</th>
+                                <th class="p-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">已繳費</th>
+                                <th class="p-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">備註</th> 
+
+<th class="p-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">操作</th>
+                            </tr>
+                        </thead>
+                        <tbody id="billing-table-body" class="bg-white divide-y divide-gray-200">
+                            <!-- 帳務資料將由 JS 動態載入 -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <!-- Modal 集合 -->
+    
+    <!-- Modal: 新增班級 -->
+    <div id="modal-add-class" class="fixed inset-0 bg-gray-600 bg-opacity-75 flex items-center justify-center z-40 hidden">
+        <div class="bg-white p-8 rounded-lg shadow-xl w-full max-w-lg">
+            <h3 class="text-xl font-semibold mb-4">新增班級</h3>
+            <form id="form-add-class">
+                <div class="mb-4">
+                    <label for="class-name" class="block text-sm font-medium text-gray-700 mb-1">班級名稱</label>
+                    <input type="text" id="class-name" required class="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500">
+                </div>
+                <div class="mb-4">
+                    <label class="block text-sm font-medium text-gray-700 mb-1">固定課表 (可複選)</label>
+                    <div class="grid grid-cols-4 gap-2">
+                        <label class="flex items-center space-x-2"><input type="checkbox" name="schedule" value="1" class="rounded"><span>週一</span></label>
+                        <label class="flex items-center space-x-2"><input type="checkbox" name="schedule" value="2" class="rounded"><span>週二</span></label>
+                        <label class="flex items-center space-x-2"><input type="checkbox" name="schedule" value="3" class="rounded"><span>週三</span></label>
+                        <label class="flex items-center space-x-2"><input type="checkbox" name="schedule" value="4" class="rounded"><span>週四</span></label>
+                        <label class="flex items-center space-x-2"><input type="checkbox" name="schedule" value="5" class="rounded"><span>週五</span></label>
+                        <label class="flex items-center space-x-2"><input type="checkbox" name="schedule" value="6" class="rounded"><span>週六</span></label>
+                        <label class="flex items-center space-x-2"><input type="checkbox" name="schedule" value="0" class="rounded"><span>週日</span></label>
+                    </div>
+                </div>
+                <div class="mt-6 flex justify-end space-x-3">
+                    <button type="button" data-modal-close="modal-add-class" class="bg-gray-200 text-gray-700 px-4 py-2 rounded-md hover:bg-gray-300">
+                        取消
+                    </button>
+                    <button type="submit" class="bg-blue-600 text-white px-4 py-2 rounded-md hover:bg-blue-700">
+                        儲存
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+    
+    <!-- Modal: 編輯班級 (NEW) -->
+    <div id="modal-edit-class" class="fixed inset-0 bg-gray-600 bg-opacity-75 flex items-center justify-center z-40 hidden">
+        <div class="bg-white p-8 rounded-lg shadow-xl w-full max-w-lg">
+            <h3 class="text-xl font-semibold mb-4">編輯班級</h3>
+            <form id="form-edit-class">
+                <input type="hidden" id="edit-class-id">
+                <div class="mb-4">
+                    <label for="edit-class-name" class="block text-sm font-medium text-gray-700 mb-1">班級名稱</label>
+                    <input type="text" id="edit-class-name" required class="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500">
+                </div>
+                <div class="mb-4">
+                    <label class="block text-sm font-medium text-gray-700 mb-1">固定課表 (可複選)</label>
+                    <div class="grid grid-cols-4 gap-2">
+                        <label class="flex items-center space-x-2"><input type="checkbox" name="schedule" value="1" class="rounded"><span>週一</span></label>
+                        <label class="flex items-center space-x-2"><input type="checkbox" name="schedule" value="2" class="rounded"><span>週二</span></label>
+                        <label class="flex items-center space-x-2"><input type="checkbox" name="schedule" value="3" class="rounded"><span>週三</span></label>
+                        <label class="flex items-center space-x-2"><input type="checkbox" name="schedule" value="4" class="rounded"><span>週四</span></label>
+                        <label class="flex items-center space-x-2"><input type="checkbox" name="schedule" value="5" class="rounded"><span>週五</span></label>
+                        <label class="flex items-center space-x-2"><input type="checkbox" name="schedule" value="6" class="rounded"><span>週六</span></label>
+                        <label class="flex items-center space-x-2"><input type="checkbox" name="schedule" value="0" class="rounded"><span>週日</span></label>
+                    </div>
+                </div>
+                <div class="mt-6 flex justify-end space-x-3">
+                    <button type="button" data-modal-close="modal-edit-class" class="bg-gray-200 text-gray-700 px-4 py-2 rounded-md hover:bg-gray-300">
+                        取消
+                    </button>
+                    <button type="submit" class="bg-blue-600 text-white px-4 py-2 rounded-md hover:bg-blue-700">
+                        儲存變更
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Modal: 管理學生 (已更新支援 Family ID) -->
+    <!-- REQ 3: 放大 Modal (max-w-3xl -> max-w-5xl) + 側邊欄佈局 -->
+    <div id="modal-manage-students" data-class-id="" class="fixed inset-0 bg-gray-600 bg-opacity-75 flex items-center justify-center z-40 hidden">
+        <div class="bg-white rounded-lg shadow-xl w-full max-w-5xl max-h-[95vh] flex flex-col overflow-hidden"> <!-- MODIFIED: 佈局改為 flex-col -->
+            
+            <!-- Modal 標題 -->
+            <div class="p-6 border-b">
+                <h3 id="student-modal-title" class="text-xl font-semibold">管理學生</h3>
+            </div>
+
+            <!-- Modal 主體 (側邊欄 + 內容) -->
+            <div class="flex-grow flex flex-row min-h-0"> <!-- MODIFIED: min-h-0 確保 flex-grow 在 flex 容器中正常運作 -->
+                
+                <!-- (Left) 側邊欄 (MODIFIED: Req 2 - 順序對調) -->
+                <div class="w-48 bg-gray-50 border-r p-4 flex-shrink-0">
+                    <nav class="flex flex-col space-y-2">
+                        <button id="btn-show-student-add-view" class="w-full text-left px-4 py-2 rounded-md text-sm font-medium">
+                            新增學生資料
+                        </button>
+                        <button id="btn-show-student-list-view" class="w-full text-left px-4 py-2 rounded-md text-sm font-medium">
+                            學生列表
+                        </button>
+                    </nav>
+                </div>
+                
+                <!-- (Right) 內容區 -->
+                <div class="flex-grow p-6 overflow-y-auto no-scrollbar">
+                    
+                    <!-- 視圖 1: 學生列表 -->
+                    <div id="view-student-list">
+                        <!-- 學生列表容器 -->
+                        <div class="w-full">
+                            <ul id="student-list" class="space-y-2">
+                                <!-- 學生列表由 JS 載入 -->
+                            </ul>
+                        </div>
+                    </div>
+
+                    <!-- 視圖 2: 新增學生 -->
+                    <div id="view-add-student" class="hidden">
+                        <h4 class="text-lg font-semibold mb-4">新增學生資料</h4>
+                        <!-- 新增學生表單 -->
+                        <form id="form-add-student" class="p-4 border rounded-lg bg-gray-50 grid grid-cols-1 md:grid-cols-2 gap-4">
+                            <div>
+                                <label for="student-name" class="block text-xs font-medium text-gray-700">學生姓名*</label>
+                                <input type="text" id="student-name" required class="mt-1 w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm text-sm">
+                            </div>
+                            <div>
+                                <label for="parent-contact" class="block text-xs font-medium text-gray-700">家長聯絡方式</label>
+                                <input type="text" id="parent-contact" class="mt-1 w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm text-sm">
+                            </div>
+                            <div>
+                                <label for="student-fee" class="block text-xs font-medium text-gray-700">單堂費用*</label>
+                                <input type="number" id="student-fee" required min="0" class="mt-1 w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm text-sm">
+                            </div>
+                            <!-- NEW: Family ID Input -->
+                            <div>
+                                <label for="student-family-id" class="block text-xs font-medium text-gray-700">Family ID (選填)</label>
+                                <input type="text" id="student-family-id" list="family-id-list" class="mt-1 w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm text-sm" placeholder="輸入或選擇 Family ID">
+                                <!-- NEW: Datalist for existing Family IDs -->
+                                <datalist id="family-id-list">
+                                    <!-- 選項將由 JS (updateFamilyIdDatalist) 動態載入 -->
+                                </datalist>
+                            </div>
+                            <div class="md:col-span-2 text-right">
+                                <button type="submit" class="bg-green-600 text-white px-4 py-2 rounded-md hover:bg-green-700 text-sm">
+                                    + 新增學生
+                                </button>
+                            </div>
+                        </form>
+                    </div>
+
+                </div> <!-- End 內容區 -->
+            </div> <!-- End Modal 主體 -->
+
+            <!-- Modal 頁腳 -->
+            <div class="p-4 bg-gray-50 border-t text-right">
+                <button type="button" data-modal-close="modal-manage-students" class="bg-gray-200 text-gray-700 px-4 py-2 rounded-md hover:bg-gray-300">
+                    關閉
+                </button>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Modal: 新增自訂假日/停課 -->
+    <div id="modal-add-holiday" class="fixed inset-0 bg-gray-600 bg-opacity-75 flex items-center justify-center z-40 hidden">
+        <div class="bg-white p-8 rounded-lg shadow-xl w-full max-w-lg">
+            <h3 class="text-xl font-semibold mb-4">新增停課日</h3>
+            <p class="mb-4">您正在為 <strong id="holiday-date-display" class="text-blue-600"></strong> 新增停課註記。</p>
+            <form id="form-add-holiday">
+                <input type="hidden" id="holiday-date">
+                <div class="mb-4">
+                    <label for="holiday-description" class="block text-sm font-medium text-gray-700 mb-1">停課事由 (例如: 颱風假)</label>
+                    <input type="text" id="holiday-description" required class="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500">
+                </div>
+                <div class="mt-6 flex justify-end space-x-3">
+                    <button type="button" data-modal-close="modal-add-holiday" class="bg-gray-200 text-gray-700 px-4 py-2 rounded-md hover:bg-gray-300">
+                        取消
+                    </button>
+                    <button type="submit" class="bg-blue-600 text-white px-4 py-2 rounded-md hover:bg-blue-700">
+                        儲存
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+    
+    <!-- NEW Modal: 編輯學生資料 (Req 2) -->
+    <div id="modal-edit-student" class="fixed inset-0 bg-gray-600 bg-opacity-75 flex items-center justify-center z-40 hidden">
+        <div class="bg-white p-8 rounded-lg shadow-xl w-full max-w-lg">
+            <h3 class="text-xl font-semibold mb-4">編輯學生資料</h3>
+            <form id="form-edit-student">
+                <input type="hidden" id="edit-student-id">
+                <div class="space-y-4">
+                    <div>
+                        <label for="edit-student-name" class="block text-sm font-medium text-gray-700 mb-1">學生姓名*</label>
+                        <input type="text" id="edit-student-name" required class="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm">
+                    </div>
+                    <div>
+                        <label for="edit-parent-contact" class="block text-sm font-medium text-gray-700 mb-1">家長聯絡方式</label>
+                        <input type="text" id="edit-parent-contact" class="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm">
+                    </div>
+                    <div>
+                        <label for="edit-student-fee" class="block text-sm font-medium text-gray-700 mb-1">單堂費用*</label>
+                        <input type="number" id="edit-student-fee" required min="0" class="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm">
+                    </div>
+                    <div>
+                        <label for="edit-student-family-id" class="block text-sm font-medium text-gray-700 mb-1">Family ID (選填)</label>
+                        <input type="text" id="edit-student-family-id" list="family-id-list" class="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm" placeholder="輸入或選擇 Family ID">
+                    </div>
+                </div>
+                <div class="mt-6 flex justify-end space-x-3">
+                    <button type="button" data-modal-close="modal-edit-student" class="bg-gray-200 text-gray-700 px-4 py-2 rounded-md hover:bg-gray-300">
+                        取消
+                    </button>
+                    <button type="submit" class="bg-blue-600 text-white px-4 py-2 rounded-md hover:bg-blue-700">
+                        儲存變更
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Modal: 產生學費通知 (已更新) -->
+    <div id="modal-notification" class="fixed inset-0 bg-gray-600 bg-opacity-75 flex items-center justify-center z-40 hidden">
+        <div class="bg-white p-8 rounded-lg shadow-xl w-full max-w-lg">
+            <h3 class="text-xl font-semibold mb-4">學費繳交通知</h3>
+            
+            <!-- NEW: 模板管理 -->
+            <div class="mb-4">
+                <label for="template-select" class="block text-sm font-medium text-gray-700 mb-1">載入模板</label>
+                <select id="template-select" class="w-full form-select rounded-md shadow-sm border-gray-300">
+                    <option value="">--- 選擇已存模板 (或使用目前內容) ---</option>
+                    <!-- 模板由 JS 載入 -->
+                </select>
+            </div>
+            
+            <textarea id="notification-content" rows="10" class="w-full p-2 border border-gray-300 rounded-md font-mono text-sm bg-gray-50"></textarea>
+            
+            <div class="mt-4 grid grid-cols-2 gap-4 items-center">
+                <div>
+                    <label for="template-name" class="block text-xs font-medium text-gray-700">模板名稱 (儲存用)</label>
+                    <input type="text" id="template-name" data-template-id="" class="w-full mt-1 px-3 py-2 border border-gray-300 rounded-md shadow-sm text-sm" placeholder="輸入新模板名稱...">
+                </div>
+                <div class="text-right space-x-2 pt-5">
+                    <button type="button" id="btn-save-template" class="bg-green-600 text-white px-3 py-2 rounded-md hover:bg-green-700 text-sm">
+                        儲存為模板
+                    </button>
+                    <button type="button" id="btn-delete-template" class="bg-red-500 text-white px-3 py-2 rounded-md hover:bg-red-700 text-sm">
+                        刪除此模板
+                    </button>
+                </div>
+            </div>
+
+            <div class="mt-6 flex justify-end space-x-3 border-t pt-4">
+                <button type="button" data-modal-close="modal-notification" class="bg-gray-200 text-gray-700 px-4 py-2 rounded-md hover:bg-gray-300">
+                    取消
+                </button>
+                <button type="button" id="btn-copy-notice" class="bg-blue-600 text-white px-4 py-2 rounded-md hover:bg-blue-700">
+                    複製通知
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- NEW Modal: 學生個人帳務紀錄 (已更新支援雜費) -->
+    <div id="modal-student-billing" class="fixed inset-0 bg-gray-600 bg-opacity-75 flex items-center justify-center z-40 hidden">
+        <div class="bg-white p-8 rounded-lg shadow-xl w-full max-w-2xl max-h-[90vh] flex flex-col"> <!-- 放大 Modal -->
+            <h3 id="student-billing-title" class="text-xl font-semibold mb-4">學生帳務紀錄</h3>
+            
+            <!-- REQ 1: 年/月 下拉選單 -->
+            <!-- MODIFIED: Changed to flex layout to include new button -->
+            <div class="mb-4 flex flex-wrap items-center space-x-4 p-4 bg-gray-100 rounded-lg">
+                <div>
+                    <label for="student-billing-year-selector" class="text-sm font-medium">選擇年份：</label>
+                    <select id="student-billing-year-selector" class="form-select rounded-md shadow-sm border-gray-300"></select>
+                </div>
+                <div>
+                    <label for="student-billing-month-selector" class="text-sm font-medium">選擇月份：</label>
+                    <select id="student-billing-month-selector" class="form-select rounded-md shadow-sm border-gray-300"></select>
+                </div>
+                <!-- NEW: 儲存預設按鈕 (for Student Modal) -->
+                <div>
+                    <button id="btn-save-billing-default-student-modal" class="bg-blue-500 text-white px-3 py-1.5 rounded-md text-sm hover:bg-blue-600" title="將目前選擇的年/月儲存為所有學生的預設值">
+                        設為預設
+                    </button>
+                </div>
+            </div>
+            
+            <div id="student-billing-content" class="flex-grow overflow-y-auto no-scrollbar pr-2">
+                <!-- 紀錄將由 JS 載入 (REQ 1: 現在只載入單一月份) -->
+            </div>
+            
+            <div class="mt-6 text-right border-t pt-4">
+                <button type="button" data-modal-close="modal-student-billing" class="bg-gray-200 text-gray-700 px-4 py-2 rounded-md hover:bg-gray-300">
+                    關閉
+                </button>
+            </div>
+        </div>
+    </div>
+    
+    <!-- REQ 2 & 4: NEW Modal: 點名 -->
+    <div id="modal-attendance" class="fixed inset-0 bg-gray-600 bg-opacity-75 flex items-center justify-center z-40 hidden">
+        <div class="bg-white p-8 rounded-lg shadow-xl w-full max-w-2xl max-h-[90vh] flex flex-col">
+            <h3 id="attendance-modal-title" class="text-xl font-semibold mb-4">點名</h3>
+            
+            <div id="attendance-student-list" class="flex-grow overflow-y-auto no-scrollbar pr-2">
+                <!-- 學生點名列表將由 JS 載入 -->
+            </div>
+            
+            <div class="mt-6 text-right border-t pt-4">
+                <button type="button" data-modal-close="modal-attendance" class="bg-gray-200 text-gray-700 px-4 py-2 rounded-md hover:bg-gray-300">
+                    關閉
+                </button>
+            </div>
+        </div>
+    </div>
+    
+    <!-- NEW: Modal: 通用確認視窗 (for Delete Class) -->
+    <div id="modal-confirm" class="fixed inset-0 bg-gray-600 bg-opacity-75 flex items-center justify-center z-50 hidden"> <!-- z-50 to be on top -->
+        <div class="bg-white p-8 rounded-lg shadow-xl w-full max-w-md">
+            <h3 id="confirm-title" class="text-xl font-semibold mb-4 text-red-700">確認操作</h3>
+            <p id="confirm-message" class="text-gray-700 mb-6">您確定要執行此操作嗎？</p>
+            <div class="mt-6 flex justify-end space-x-3">
+                <button id="btn-confirm-cancel" class="bg-gray-200 text-gray-700 px-4 py-2 rounded-md hover:bg-gray-300">
+                    取消
+                </button>
+                <button id="btn-confirm-action" class="bg-red-600 text-white px-4 py-2 rounded-md hover:bg-red-700">
+                    確認
+                </button>
+            </div>
+        </div>
+    </div>
+    
+    <!-- NEW: Modal: 編輯繳費詳情 -->
+    <div id="modal-payment-details" class="fixed inset-0 bg-gray-600 bg-opacity-75 flex items-center justify-center z-40 hidden">
+        <div class="bg-white p-8 rounded-lg shadow-xl w-full max-w-lg">
+            <h3 class="text-xl font-semibold mb-4">編輯繳費詳情</h3>
+            <input type="hidden" id="payment-modal-invoice-ids">
+            <div class="space-y-4">
+                <div>
+                    <label for="payment-date" class="block text-sm font-medium text-gray-700 mb-1">繳費日期</label>
+                    <input type="date" id="payment-date" class="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm">
+                </div>
+                <div>
+                    <label for="payment-notes" class="block text-sm font-medium text-gray-700 mb-1">備註</label>
+                    <textarea id="payment-notes" rows="3" class="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm" placeholder="例如：轉帳末五碼、現金..."></textarea>
+                </div>
+            </div>
+            <div class="mt-6 flex justify-between space-x-3">
+                <div>
+                    <button type="button" id="btn-mark-unpaid" class="bg-red-600 text-white px-4 py-2 rounded-md hover:bg-red-700">
+                        標記為未繳費
+                    </button>
+                </div>
+                <div class="space-x-3">
+                    <button type="button" data-modal-close="modal-payment-details" class="bg-gray-200 text-gray-700 px-4 py-2 rounded-md hover:bg-gray-300">
+                        取消
+                    </button>
+                    <button type="button" id="btn-save-payment-details" class="bg-blue-600 text-white px-4 py-2 rounded-md hover:bg-blue-700">
+                        儲存 (標記為已繳)
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+</body>
+</html>
